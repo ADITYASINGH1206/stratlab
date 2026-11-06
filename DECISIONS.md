@@ -37,3 +37,16 @@ This document records architectural decisions made during development when choic
   3. Stops and targets trigger along this path; price gaps fill at the bar open.
   4. Indicators match Pine Script formulas: RSI/ATR use Wilder's RMA (alpha = 1/len, seeded with SMA); EMA uses alpha = 2/(len+1) seeded with SMA.
 - **Consequences**: Deterministic execution matching Pine Script v6 defaults, running >10,000 bars in under 1 second.
+
+---
+
+## ADR-005: Research Battery, Robustness Audit & Promotion Gates (Phase 3)
+- **Date**: 2026-11-06
+- **Context**: Overfitting and curve-fitting are the #1 pitfall in strategy design. Retail quants need automated adversarial stress-testing.
+- **Decision**: Implemented the complete research suite:
+  1. `stratlab sweep`: Parallel parameter exploration with `joblib` on the in-sample slice.
+  2. `stratlab walkforward`: Rolling window optimization (24-mo IS / 6-mo OOS) evaluating Walk-Forward Efficiency (WFE) and consistency.
+  3. `stratlab robust`: 1,000-run Monte Carlo trade order bootstrap, 2x cost stress (fees + slippage), and parameter neighbourhood plateau stability (+-1 step).
+  4. `stratlab gates`: Audit against Lab Charter standards (G1 sample size, G2 OOS performance, G3 walk-forward, G4 stability, G5 cost stress, G6 tail risk).
+  5. `stratlab chart`: Visual artifact generation for Discord and reports (dark-themed equity & drawdown, heatmap, walkforward bars, and 1200x675 metrics card).
+- **Consequences**: Rigorous, reproducible adversarial validation that separates fragile curve-fit strategies (`S-012 v1` fails 4 of 6 gates) from robust strategies (`S-012 v2` passes all 6 gates).

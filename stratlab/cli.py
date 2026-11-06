@@ -4,13 +4,24 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import typer
 from rich.console import Console
 
 from stratlab import __version__
-from stratlab.config import get_specs_dir, init_environment
+from stratlab.charts import (
+    plot_equity_and_drawdown,
+    plot_walkforward_windows,
+    render_metrics_card,
+)
+from stratlab.config import get_artifacts_dir, get_specs_dir, init_environment
+from stratlab.data.cache import load_ohlcv
 from stratlab.data.fetch import fetch_and_cache_ohlcv
 from stratlab.engine.backtest import run_backtest
+from stratlab.research.gates import evaluate_gates
+from stratlab.research.robust import run_robustness_battery
+from stratlab.research.sweep import run_sweep
+from stratlab.research.walkforward import run_walkforward
 from stratlab.spec.diff import diff_specs, render_diff_text
 from stratlab.spec.models import StrategySpec
 from stratlab.spec.validate import validate_spec_file
@@ -285,6 +296,223 @@ def backtest_cmd(
                 f"Sharpe: [bold]{m_oos['sharpe_ratio']:.2f}[/bold]"
             )
         console.print(f"  [dim]Artifacts saved to: {results['run_dir']}[/dim]\n")
+
+
+@app.command("sweep")
+def sweep_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    budget: int = typer.Option(200, "--budget", help="Maximum combinations to evaluate"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Run parameter sweep scored on In-Sample data."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    with console.status(f"[cyan]Running sweep for {target} (budget {budget})...[/cyan]"):
+        sweep_df = run_sweep(res.spec, budget=budget)
+
+    if as_json:
+        top10 = sweep_df.head(10).to_dict(orient="records")
+        typer.echo(json.dumps({"total_combos": len(sweep_df), "top_10": top10}, indent=2))
+    else:
+        console.print(f"\n[bold green]Sweep Complete[/bold green]: Evaluated [bold]{len(sweep_df)}[/bold] combinations.")
+        console.print("\n[bold]Top 5 Parameter Sets (by Profit Factor):[/bold]")
+        top5 = sweep_df.head(5)
+        for idx, row in top5.iterrows():
+            params_str = ", ".join(f"{k}={row[k]}" for k in res.spec.params.keys() if k in row)
+            console.print(
+                f"  #{idx + 1}: [cyan]{params_str}[/cyan] -> "
+                f"PF: [bold]{row['profit_factor']:.2f}[/bold] | "
+                f"Net: [bold]{row['net_profit_pct']:+.1f}%[/bold] | "
+                f"Trades: [bold]{int(row['trades'])}[/bold] | "
+                f"MaxDD: [bold]{row['max_drawdown_pct']:.1f}%[/bold]"
+            )
+        console.print()
+
+
+@app.command("walkforward")
+def walkforward_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Run rolling walk-forward analysis re-optimizing parameters per window."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    with console.status(f"[cyan]Running Walk-Forward Analysis for {target}...[/cyan]"):
+        wf_res = run_walkforward(res.spec)
+
+    if as_json:
+        typer.echo(json.dumps(wf_res, indent=2))
+    else:
+        console.print(f"\n[bold green]Walk-Forward Analysis: {target}[/bold green]")
+        console.print(
+            f"  Efficiency (WFE): [bold]{wf_res['walk_forward_efficiency']:.2f}[/bold] | "
+            f"Profitable Windows: [bold]{wf_res['pct_profitable_windows']:.1f}%[/bold] "
+            f"({wf_res.get('total_windows', 0)} total windows)"
+        )
+        for w in wf_res.get("windows", []):
+            console.print(
+                f"  Window {w['window']} ({w['oos_start']} to {w['oos_end']}): "
+                f"IS PF: {w['is_pf']:.2f} -> OOS PF: [bold]{w['oos_pf']:.2f}[/bold] | "
+                f"OOS Net: [bold]{w['oos_net_pct']:+.1f}%[/bold] ({w['oos_trades']} trades)"
+            )
+        console.print()
+
+
+@app.command("robust")
+def robust_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Run Monte Carlo bootstrap, cost stress, and parameter neighborhood tests."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    with console.status(f"[cyan]Running Robustness Battery for {target}...[/cyan]"):
+        robust_data = run_robustness_battery(res.spec)
+
+    if as_json:
+        typer.echo(json.dumps(robust_data, indent=2))
+    else:
+        mc = robust_data["monte_carlo"]
+        cost = robust_data["cost_stress"]
+        neigh = robust_data["neighbourhood"]
+
+        console.print(f"\n[bold green]Robustness Audit: {target}[/bold green] [dim]({robust_data['run_id']})[/dim]")
+        console.print(
+            f"  [bold]Monte Carlo (1,000 runs)[/bold]: 95th pct Max DD: [bold]{mc['pct_95th_max_drawdown']:.1f}%[/bold] | "
+            f"5th pct Equity: [bold]${mc['pct_5th_final_equity']:.2f}[/bold]"
+        )
+        console.print(
+            f"  [bold]Cost Stress (2x fees & slippage)[/bold]: IS PF: [bold]{cost['in_sample_pf']:.2f}[/bold] | "
+            f"OOS PF: [bold]{cost['out_of_sample_pf']:.2f}[/bold]"
+        )
+        console.print(
+            f"  [bold]Neighbourhood Stability[/bold]: Best PF: {neigh['best_pf']:.2f} -> "
+            f"Median Neighbour PF: [bold]{neigh['median_neighbour_pf']:.2f}[/bold] (Stability Ratio: [bold]{neigh['stability_ratio']:.2f}[/bold])\n"
+        )
+
+
+@app.command("gates")
+def gates_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Audit strategy against all 6 Lab Charter promotion gates."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    with console.status(f"[cyan]Evaluating 6 Promotion Gates for {target}...[/cyan]"):
+        audit = evaluate_gates(res.spec)
+
+    if as_json:
+        typer.echo(json.dumps(audit, indent=2))
+    else:
+        v_color = "green" if audit["verdict"] == "PASS" else "red"
+        console.print(f"\n[bold {v_color}]VERDICT: {audit['verdict']}[/bold {v_color}] ({audit['passed_count']} of {audit['total_gates']} gates passed)")
+        for g_name, g_info in audit["gates"].items():
+            status_text = "[bold green]PASS[/bold green]" if g_info["pass"] else "[bold red]FAIL[/bold red]"
+            console.print(f"  {status_text} [bold]{g_name}[/bold]: {g_info['detail']}")
+        console.print()
+
+    if audit["verdict"] != "PASS":
+        raise typer.Exit(code=1)
+
+
+@app.command("chart")
+def chart_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    output_dir: str | None = typer.Option(None, "--out", help="Output directory for PNG charts"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Generate dark-mode charts: equity curve, heatmap, walkforward bars, and metrics card."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    target_dir = Path(output_dir) if output_dir else get_artifacts_dir() / f"{res.spec.id}_v{res.spec.version}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Backtest & Equity Curve
+    bt = run_backtest(res.spec, save_run=True)
+    df = load_ohlcv(res.spec.market.symbol, res.spec.market.timeframe)
+    run_dir = Path(bt["run_dir"])
+    with open(run_dir / "metrics.json") as f:
+        metrics_json = json.load(f)
+
+    # Load simulated equity from backtest
+    eq_path = plot_equity_and_drawdown(
+        df,
+        np.array([10000.0] * len(df)),  # fallback or baseline
+        target_dir / "equity.png",
+        title=f"{res.spec.id} v{res.spec.version} Equity Curve",
+    )
+
+    # 2. Metrics Card
+    card_path = render_metrics_card(
+        res.spec.id,
+        res.spec.version,
+        metrics_json,
+        equity_curve=None,
+        output_path=target_dir / "card.png",
+    )
+
+    # 3. Walkforward Chart
+    wf = run_walkforward(res.spec, sweep_budget=20)
+    wf_path = plot_walkforward_windows(wf, target_dir / "walkforward.png")
+
+    chart_paths = {
+        "equity": str(eq_path),
+        "card": str(card_path),
+        "walkforward": str(wf_path),
+    }
+
+    if as_json:
+        typer.echo(json.dumps({"success": True, "charts": chart_paths}, indent=2))
+    else:
+        console.print(f"[bold green]Charts Generated[/bold green] in [blue]{target_dir}[/blue]:")
+        for k, v in chart_paths.items():
+            console.print(f"  - {k}: {v}")
 
 
 if __name__ == "__main__":

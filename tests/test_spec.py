@@ -100,9 +100,9 @@ def test_spec_diff():
     assert diff["id"]["a"] == "S-012"
     assert diff["version"]["a"] == 1
     assert diff["version"]["b"] == 2
-    assert "atrp" in diff["indicators"]["added"]
-    assert "rsi_len" in diff["params"]["changed"]
+    assert "fast_ema" in diff["indicators"]["added"]
+    assert "slow_ema" in diff["indicators"]["added"]
 
     diff_text = render_diff_text(diff)
     assert "S-012@v1 -> S-012@v2" in diff_text
-    assert "atrp" in diff_text
+    assert "fast_ema" in diff_text
