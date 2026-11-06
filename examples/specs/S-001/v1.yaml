@@ -20,6 +20,9 @@ indicators:
 entry:
   long:
     crosses_above: [fast_ma, slow_ma]
+  # direction is long, so this only closes the long (exit.opposite_signal)
+  short:
+    crosses_below: [fast_ma, slow_ma]
 exit:
   opposite_signal: true
 risk:

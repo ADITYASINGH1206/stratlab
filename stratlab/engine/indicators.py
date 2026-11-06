@@ -1,63 +1,65 @@
 """Technical indicators calculated via NumPy with exact TradingView formula parity."""
 
+import ast
+
 import numpy as np
+import pandas as pd
+from numba import njit
+
+
+@njit(cache=True)
+def _seeded_recursive(source: np.ndarray, length: int, alpha: float) -> np.ndarray:
+    """Pine's ta.ema / ta.rma recursion.
+
+    The first value is the SMA of the first `length` consecutive valid values; after that
+    out[i] = alpha * x[i] + (1 - alpha) * out[i-1]. Leading NaNs (e.g. an EMA of an RSI)
+    are skipped instead of poisoning the whole series, which is what Pine does.
+    """
+    n = len(source)
+    out = np.full(n, np.nan)
+    if length <= 0:
+        return out
+    run = 0
+    seed_idx = -1
+    for i in range(n):
+        if np.isnan(source[i]):
+            run = 0
+        else:
+            run += 1
+            if run == length:
+                seed_idx = i
+                break
+    if seed_idx < 0:
+        return out
+    s = 0.0
+    for j in range(seed_idx - length + 1, seed_idx + 1):
+        s += source[j]
+    out[seed_idx] = s / length
+    for i in range(seed_idx + 1, n):
+        x = source[i]
+        if np.isnan(x):
+            out[i] = out[i - 1]
+        else:
+            out[i] = alpha * x + (1.0 - alpha) * out[i - 1]
+    return out
 
 
 def rma(source: np.ndarray, length: int) -> np.ndarray:
-    """TradingView's ta.rma (Wilder's Moving Average).
-
-    alpha = 1 / length
-    Seeded with the simple moving average (SMA) of the first `length` valid values.
-    """
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < length or length <= 0:
-        return out
-
-    # First value is SMA of first length elements
-    sma_first = np.mean(source[:length])
-    out[length - 1] = sma_first
-    alpha = 1.0 / length
-
-    for i in range(length, n):
-        out[i] = alpha * source[i] + (1.0 - alpha) * out[i - 1]
-
-    return out
+    """TradingView's ta.rma (Wilder): alpha = 1/length, seeded with an SMA."""
+    return _seeded_recursive(np.asarray(source, dtype=np.float64), int(length), 1.0 / length if length > 0 else 0.0)
 
 
 def sma(source: np.ndarray, length: int) -> np.ndarray:
-    """Simple Moving Average (ta.sma)."""
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < length or length <= 0:
-        return out
-
-    # Cumulative sum approach for O(N) performance
-    cumsum = np.cumsum(source)
-    out[length - 1] = cumsum[length - 1] / length
-    out[length:] = (cumsum[length:] - cumsum[:-length]) / length
-    return out
+    """Simple Moving Average (ta.sma). A window containing NaN is NaN, like Pine."""
+    src = np.asarray(source, dtype=np.float64)
+    if length <= 0:
+        return np.full(len(src), np.nan)
+    return pd.Series(src).rolling(int(length), min_periods=int(length)).mean().to_numpy()
 
 
 def ema(source: np.ndarray, length: int) -> np.ndarray:
-    """TradingView's ta.ema.
-
-    alpha = 2 / (length + 1)
-    Seeded with SMA of first `length` values, matching Pine Script.
-    """
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if n < length or length <= 0:
-        return out
-
-    # Pine seeds EMA with the SMA of the first length values
-    out[length - 1] = np.mean(source[:length])
-    alpha = 2.0 / (length + 1.0)
-
-    for i in range(length, n):
-        out[i] = alpha * source[i] + (1.0 - alpha) * out[i - 1]
-
-    return out
+    """TradingView's ta.ema: alpha = 2/(length+1), seeded with an SMA."""
+    return _seeded_recursive(np.asarray(source, dtype=np.float64), int(length), 2.0 / (length + 1.0))
 
 
 def wma(source: np.ndarray, length: int) -> np.ndarray:
@@ -105,33 +107,26 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int) -> np
 
 
 def rsi(source: np.ndarray, length: int) -> np.ndarray:
-    """Relative Strength Index (ta.rsi) using Wilder's RMA smoothing."""
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
+    """Relative Strength Index (ta.rsi): RMA of gains and losses.
+
+    Pine: rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - 100 / (1 + up / down).
+    The first value appears on bar `length` (the first change is on bar 1).
+    """
+    src = np.asarray(source, dtype=np.float64)
+    n = len(src)
     if n <= length or length <= 0:
-        return out
-
-    diff = np.diff(source)
-    gains = np.where(diff > 0, diff, 0.0)
-    losses = np.where(diff < 0, -diff, 0.0)
-
-    # RMA of gains and losses over length
-    avg_gain = rma(gains, length)
-    avg_loss = rma(losses, length)
-
-    for i in range(length - 1, len(diff)):
-        ag = avg_gain[i]
-        al = avg_loss[i]
-        bar_idx = i + 1  # diff is length n - 1
-        if np.isnan(ag) or np.isnan(al):
-            continue
-        if al == 0.0:
-            out[bar_idx] = 100.0 if ag > 0 else 50.0
-        else:
-            rs = ag / al
-            out[bar_idx] = 100.0 - (100.0 / (1.0 + rs))
-
-    return out
+        return np.full(n, np.nan)
+    change = np.full(n, np.nan)
+    change[1:] = np.diff(src)
+    gains = np.where(np.isnan(change), np.nan, np.maximum(change, 0.0))
+    losses = np.where(np.isnan(change), np.nan, np.maximum(-change, 0.0))
+    up = rma(gains, length)
+    down = rma(losses, length)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = 100.0 - 100.0 / (1.0 + up / down)
+    out = np.where(down == 0.0, 100.0, out)
+    out = np.where((up == 0.0) & (down != 0.0), 0.0, out)
+    return np.where(np.isnan(up) | np.isnan(down), np.nan, out)
 
 
 def macd(source: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -175,21 +170,15 @@ def bb(source: np.ndarray, length: int = 20, mult: float = 2.0) -> tuple[np.ndar
 
 
 def highest(source: np.ndarray, length: int) -> np.ndarray:
-    """Rolling highest over length bars (ta.highest)."""
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
-    for i in range(length - 1, n):
-        out[i] = np.max(source[i - length + 1 : i + 1])
-    return out
+    """Rolling highest over `length` bars including the current bar (ta.highest)."""
+    src = np.asarray(source, dtype=np.float64)
+    return pd.Series(src).rolling(int(length), min_periods=int(length)).max().to_numpy()
 
 
 def lowest(source: np.ndarray, length: int) -> np.ndarray:
-    """Rolling lowest over length bars (ta.lowest)."""
-    n = len(source)
-    out = np.full(n, np.nan, dtype=np.float64)
-    for i in range(length - 1, n):
-        out[i] = np.min(source[i - length + 1 : i + 1])
-    return out
+    """Rolling lowest over `length` bars including the current bar (ta.lowest)."""
+    src = np.asarray(source, dtype=np.float64)
+    return pd.Series(src).rolling(int(length), min_periods=int(length)).min().to_numpy()
 
 
 def donchian(high: np.ndarray, low: np.ndarray, length: int) -> tuple[np.ndarray, np.ndarray]:
@@ -197,9 +186,60 @@ def donchian(high: np.ndarray, low: np.ndarray, length: int) -> tuple[np.ndarray
     return highest(high, length), lowest(low, length)
 
 
+_BIN_OPS = {
+    ast.Add: np.add,
+    ast.Sub: np.subtract,
+    ast.Mult: np.multiply,
+    ast.Div: np.divide,
+}
+
+
+def check_expression(expr: str, names: set[str]) -> list[str]:
+    """Return a list of problems with an `expr` indicator (empty list means OK).
+
+    Only numbers, known series names, + - * /, unary minus and parentheses are allowed.
+    Specs can be written by anyone in the room, so nothing else ever reaches the evaluator.
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        return [f"expression '{expr}' is not valid arithmetic: {e.msg}"]
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Expression, ast.Load, ast.UnaryOp, ast.USub, ast.UAdd, ast.BinOp, *_BIN_OPS)):
+            continue
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            continue
+        if isinstance(node, ast.Name):
+            if node.id not in names:
+                problems.append(f"expression '{expr}' uses unknown series '{node.id}'")
+            continue
+        problems.append(f"expression '{expr}' may only use numbers, series names, + - * / and parentheses")
+        break
+    return problems
+
+
 def evaluate_expression(expr: str, context: dict[str, np.ndarray]) -> np.ndarray:
-    """Safely evaluate arithmetic series expressions, e.g. 'atr / close * 100'."""
-    safe_dict = {k: v for k, v in context.items() if isinstance(v, (np.ndarray, float, int))}
-    safe_dict["np"] = np
-    # Evaluate within restricted globals
-    return eval(expr, {"__builtins__": {}}, safe_dict)
+    """Evaluate arithmetic on series, e.g. 'atr / close * 100', without eval()."""
+    problems = check_expression(expr, set(context))
+    if problems:
+        raise ValueError(problems[0])
+    n = len(context["close"])
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            return np.asarray(context[node.id], dtype=np.float64)
+        if isinstance(node, ast.UnaryOp):
+            v = ev(node.operand)
+            return -v if isinstance(node.op, ast.USub) else v
+        return _BIN_OPS[type(node.op)](ev(node.left), ev(node.right))
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = ev(ast.parse(expr, mode="eval"))
+    out = np.broadcast_to(np.asarray(out, dtype=np.float64), (n,)).copy()
+    out[~np.isfinite(out)] = np.nan
+    return out

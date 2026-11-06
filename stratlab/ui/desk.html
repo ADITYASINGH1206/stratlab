@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StratLab Desk</title>
+<style>
+:root {
+  --paper: #eef1ec;
+  --paper-2: #e3e8e1;
+  --grid: #d3dbd1;
+  --ink: #17233a;
+  --ink-2: #4a566b;
+  --ink-3: #7a8597;
+  --pass: #23704a;
+  --fail: #b42318;
+  --park: #8a5a00;
+  --marker: #f5c400;
+  --display: "Bahnschrift", "DIN Alternate", "DIN 2014", "Barlow Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --body: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+.ledger td, .ledger th { text-align: left; vertical-align: top; }
+.ledger td.n, .ledger th.n { text-align: right; white-space: nowrap; }
+.ledger td:first-child { white-space: nowrap; }
+html { background: var(--paper); color: var(--ink); }
+body {
+  margin: 0; font: 15px/1.5 var(--body); font-feature-settings: "tnum" 1, "cv11" 1;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: -1px -1px;
+}
+a { color: inherit; }
+:focus-visible { outline: 3px solid var(--marker); outline-offset: 2px; }
+h1, h2, h3 { font-family: var(--display); font-stretch: condensed; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+
+/* masthead */
+.mast { display: grid; grid-template-columns: 1fr auto; gap: 8px 32px; align-items: end;
+  padding: 28px 32px 18px; border-bottom: 3px solid var(--ink); background: var(--paper); }
+.mast h1 { font-size: 44px; line-height: 0.9; }
+.mast p { margin: 6px 0 0; color: var(--ink-2); max-width: 60ch; }
+.meta { color: var(--ink-3); font-size: 13px; text-align: right; }
+nav { display: flex; gap: 4px; padding: 0 32px; background: var(--paper); border-bottom: 1px solid var(--ink); }
+nav button { font: 600 15px var(--body); color: var(--ink-2); background: none; border: 0; padding: 12px 14px 10px;
+  border-bottom: 3px solid transparent; cursor: pointer; }
+nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+
+/* cases layout */
+.cases { display: grid; grid-template-columns: 260px 1fr; min-height: 70vh; }
+.rail { border-right: 1px solid var(--ink); background: var(--paper); padding: 12px 0; }
+.rail button { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; width: 100%; text-align: left; border: 0;
+  background: none; padding: 10px 20px; cursor: pointer; color: var(--ink); font: inherit; border-left: 4px solid transparent; }
+.rail button:hover { background: var(--paper-2); }
+.rail button[aria-current="true"] { border-left-color: var(--ink); background: var(--paper-2); }
+.rail .ref { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 20px; line-height: 1.1; }
+.rail .nm { grid-column: 1 / -1; color: var(--ink-2); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tally { display: flex; gap: 3px; align-self: center; }
+.tally i { width: 9px; height: 9px; border: 1.5px solid var(--ink-3); display: block; }
+.tally i.p { background: var(--pass); border-color: var(--pass); }
+.tally i.f { background: var(--fail); border-color: var(--fail); }
+
+.sheet { padding: 28px 40px 60px; max-width: 1180px; }
+.head { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: start; }
+.head h2 { font-size: 64px; line-height: 0.9; }
+.head .name { font-size: 20px; margin: 8px 0 4px; }
+.head .sub { color: var(--ink-2); }
+.cand { margin-top: 14px; padding: 8px 12px; background: var(--paper); border: 1px solid var(--ink); display: inline-block; font-size: 14px; }
+.cand b { font-weight: 600; }
+
+/* the stamp: the one loud thing on the page */
+.stamp { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 34px; line-height: 1;
+  padding: 10px 18px 8px; border: 4px double currentColor; transform: rotate(-7deg); margin: 12px 8px 0 0;
+  text-align: center; background: color-mix(in srgb, var(--paper) 85%, transparent); }
+.stamp small { display: block; font-family: var(--body); font-size: 12px; font-weight: 600; letter-spacing: 0; margin-top: 4px; }
+.stamp.pass { color: var(--pass); } .stamp.fail { color: var(--fail); } .stamp.park { color: var(--park); } .stamp.none { color: var(--ink-3); }
+.stamp.thump { animation: thump 220ms ease-out; }
+@keyframes thump { from { transform: rotate(-7deg) scale(1.25); opacity: 0.2; } to { transform: rotate(-7deg) scale(1); opacity: 1; } }
+
+section.block { margin-top: 34px; }
+section.block > h3 { font-size: 24px; border-bottom: 2px solid var(--ink); padding-bottom: 4px; margin-bottom: 14px;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+section.block > h3 span { font-family: var(--body); font-size: 13px; font-weight: 400; color: var(--ink-2); font-stretch: normal; }
+
+/* gate rail */
+.gates { display: grid; grid-template-columns: repeat(6, 1fr); border: 2px solid var(--ink); background: var(--paper); }
+.gate { padding: 12px 12px 14px; border-right: 1px solid var(--ink); position: relative; min-height: 168px; display: flex; flex-direction: column; }
+.gate:last-child { border-right: 0; }
+.gate .g { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 18px; }
+.gate .mark { font-weight: 700; font-size: 13px; margin-top: 2px; }
+.gate.pass .mark { color: var(--pass); } .gate.fail .mark { color: var(--fail); }
+.gate.fail { background: color-mix(in srgb, var(--fail) 7%, var(--paper)); }
+.gate .big { font-family: var(--display); font-stretch: condensed; font-size: 34px; font-weight: 700; line-height: 1; margin-top: 10px; }
+.gate .thr { font-size: 12px; color: var(--ink-2); }
+.gate .det { font-size: 12px; color: var(--ink-2); margin-top: auto; padding-top: 10px; line-height: 1.35; }
+.gauge { height: 8px; background: var(--paper-2); border: 1px solid var(--ink-3); position: relative; margin-top: 8px; }
+.gauge b { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); }
+.gate.fail .gauge b { background: var(--fail); }
+.gauge i { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--ink); left: 50%; }
+
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+table { border-collapse: collapse; width: 100%; background: var(--paper); }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child { text-align: left; }
+thead th { font-weight: 600; border-bottom: 2px solid var(--ink); }
+svg { display: block; width: 100%; height: auto; background: var(--paper); border: 1px solid var(--ink); }
+svg text { font: 11px var(--body); fill: var(--ink-2); }
+.note { color: var(--ink-2); font-size: 14px; max-width: 70ch; }
+.empty { border: 2px dashed var(--ink-3); padding: 24px; background: var(--paper); max-width: 70ch; }
+.empty code, .note code, td code { background: var(--paper-2); padding: 1px 5px; }
+details { margin-top: 12px; background: var(--paper); border: 1px solid var(--ink); }
+details summary { cursor: pointer; padding: 10px 14px; font-weight: 600; }
+pre { margin: 0; padding: 14px; overflow: auto; font: 12.5px/1.45 "JetBrains Mono", "SFMono-Regular", Consolas, monospace; border-top: 1px solid var(--grid); max-height: 460px; }
+.stress { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border: 1px solid var(--ink); background: var(--paper); }
+.stress div { padding: 12px 14px; border-right: 1px solid var(--grid); }
+.stress div:last-child { border-right: 0; }
+.stress strong { display: block; font-family: var(--display); font-stretch: condensed; font-size: 18px; }
+
+/* ledger + charter */
+.page { padding: 28px 40px 60px; max-width: 1180px; }
+.page h2 { font-size: 40px; }
+.v-PROMOTE { color: var(--pass); font-weight: 700; } .v-KILL { color: var(--fail); font-weight: 700; } .v-PARK { color: var(--park); font-weight: 700; }
+.charter { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0; border: 2px solid var(--ink); background: var(--paper); margin-top: 18px; }
+.charter div { padding: 16px 18px; border-bottom: 1px solid var(--grid); border-right: 1px solid var(--grid); }
+.charter h3 { font-size: 22px; }
+.foot { padding: 18px 32px; color: var(--ink-3); font-size: 13px; border-top: 1px solid var(--ink); background: var(--paper); }
+
+@media (max-width: 1000px) {
+  .gates { grid-template-columns: repeat(3, 1fr); }
+  .gate:nth-child(3) { border-right: 0; }
+  .gate:nth-child(-n+3) { border-bottom: 1px solid var(--ink); }
+  .two { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .mast { grid-template-columns: 1fr; padding: 20px; } .meta { text-align: left; }
+  nav { padding: 0 12px; overflow-x: auto; }
+  .cases { grid-template-columns: 1fr; }
+  .rail { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--ink); padding: 0; }
+  .rail button { min-width: 200px; border-left: 0; border-bottom: 4px solid transparent; }
+  .rail button[aria-current="true"] { border-bottom-color: var(--ink); }
+  .sheet, .page { padding: 20px; }
+  .head { grid-template-columns: 1fr; } .head h2 { font-size: 48px; }
+  .gates { grid-template-columns: repeat(2, 1fr); }
+  .gate { border-right: 1px solid var(--ink) !important; border-bottom: 1px solid var(--ink); }
+  .stress, .charter { grid-template-columns: 1fr; }
+  section.block > h3 { flex-direction: column; align-items: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .stamp.thump { animation: none; } }
+@media print { body { background: #fff; } nav, .rail { display: none; } .cases { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="mast">
+  <div>
+    <h1>StratLab Desk</h1>
+    <p>Every strategy the room has tested, what the Skeptic found, and what the humans decided.</p>
+  </div>
+  <div class="meta" id="meta"></div>
+</header>
+<nav role="tablist" aria-label="Views">
+  <button role="tab" id="tab-cases" aria-selected="true" aria-controls="view-cases">Cases</button>
+  <button role="tab" id="tab-ledger" aria-selected="false" aria-controls="view-ledger">Ledger</button>
+  <button role="tab" id="tab-charter" aria-selected="false" aria-controls="view-charter">Lab Charter</button>
+</nav>
+<main>
+  <div id="view-cases" class="cases" role="tabpanel" aria-labelledby="tab-cases">
+    <div class="rail" id="rail" aria-label="Strategies"></div>
+    <article class="sheet" id="sheet" aria-live="polite"></article>
+  </div>
+  <div id="view-ledger" class="page" role="tabpanel" aria-labelledby="tab-ledger" hidden></div>
+  <div id="view-charter" class="page" role="tabpanel" aria-labelledby="tab-charter" hidden></div>
+</main>
+<footer class="foot">Generated by <code>stratlab ui</code>. Numbers come from the StratLab engine on the cached market data. Research tool, not financial advice; StratLab never places orders.</footer>
+
+<script>
+const DATA = /*__STRATLAB_DATA__*/null;
+const GATES = [
+  ["G1_sample_size", "G1", "Sample size"], ["G2_out_of_sample", "G2", "Out-of-sample"], ["G3_walk_forward", "G3", "Walk-forward"],
+  ["G4_stability", "G4", "Stability"], ["G5_costs", "G5", "Costs"], ["G6_tail_risk", "G6", "Tail risk"],
+];
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const f2 = (v) => (v === null || v === undefined || Number.isNaN(v) ? "–" : Number(v).toFixed(2));
+const pct = (v) => (v === null || v === undefined ? "–" : `${v > 0 ? "+" : ""}${Number(v).toFixed(1)}%`);
+const money = (v) => `$${Math.round(v).toLocaleString("en-US")}`;
+
+function ledgerFor(ref) {
+  const [id, v] = ref.split("@v");
+  const rows = (DATA.ledger || []).filter((e) => e.spec_id === id && String(e.version) === v);
+  return rows.length ? rows[rows.length - 1] : null;
+}
+
+function gateView(c) {
+  const ch = DATA.charter, g = c.gates.gates;
+  const dd = ch.g6_tail_risk.max_drawdown_limit_pct * ch.g6_tail_risk.mc_drawdown_multiple;
+  const spec = {
+    G1_sample_size: [g.G1_sample_size.values.is_trades, ch.g1_sample_size.min_is_trades, (v) => `${v}`, `IS trades, min ${ch.g1_sample_size.min_is_trades}`],
+    G2_out_of_sample: [g.G2_out_of_sample.values.oos_pf, ch.g2_out_of_sample.min_oos_pf, f2, `OOS profit factor, min ${ch.g2_out_of_sample.min_oos_pf}`],
+    G3_walk_forward: [g.G3_walk_forward.values.wfe, ch.g3_walk_forward.min_wfe, f2, `walk-forward efficiency, min ${ch.g3_walk_forward.min_wfe}`],
+    G4_stability: [g.G4_stability.values.stability_ratio, ch.g4_stability.min_neighbour_pf_ratio, (v) => (v === null ? "n/a" : f2(v)), `neighbour PF ratio, min ${ch.g4_stability.min_neighbour_pf_ratio}`],
+    G5_costs: [g.G5_costs.values.stressed_pf, ch.g5_costs.min_stressed_pf, f2, `PF at ${ch.g5_costs.cost_multiplier}x costs, min ${ch.g5_costs.min_stressed_pf}`],
+    G6_tail_risk: [g.G6_tail_risk.values.p95_max_dd, dd, (v) => `${f2(v)}%`, `95th pct Monte Carlo drawdown, max ${dd}%`],
+  };
+  return GATES.map(([key, code, title]) => {
+    const gate = g[key], [val, thr, fmt, label] = spec[key];
+    let fill = 0;
+    if (val !== null && thr) fill = key === "G6_tail_risk" ? Math.min(1, val / (2 * thr)) : Math.min(1, val / (2 * thr));
+    return `<div class="gate ${gate.pass ? "pass" : "fail"}">
+      <span class="g">${code} ${title}</span><span class="mark">${gate.pass ? "Pass" : "Fail"}</span>
+      <span class="big">${fmt(val)}</span><span class="thr">${esc(label)}</span>
+      <div class="gauge" role="img" aria-label="${esc(label)}: ${fmt(val)}"><b style="width:${Math.max(0, fill) * 100}%"></b><i></i></div>
+      <span class="det">${esc(gate.detail)}</span></div>`;
+  }).join("");
+}
+
+function equitySVG(eq) {
+  const W = 1000, H = 300, P = { l: 64, r: 16, t: 14, b: 26 }, DDH = 70;
+  const v = eq.v, n = v.length, lo = Math.min(...v), hi = Math.max(...v);
+  const x = (i) => P.l + (i / (n - 1)) * (W - P.l - P.r);
+  const y = (val) => P.t + (1 - (val - lo) / (hi - lo || 1)) * (H - P.t - P.b - DDH - 10);
+  let peak = -Infinity; const dd = v.map((val) => { peak = Math.max(peak, val); return (peak - val) / peak; });
+  const maxDD = Math.max(...dd, 0.0001);
+  const ddY = (d) => H - P.b - DDH + (d / maxDD) * DDH;
+  const oosIdx = eq.t.findIndex((t) => t >= eq.oos_start);
+  const line = v.map((val, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(val).toFixed(1)}`).join("");
+  const area = `M${x(0)},${ddY(0)}` + dd.map((d, i) => `L${x(i).toFixed(1)},${ddY(d).toFixed(1)}`).join("") + `L${x(n - 1)},${ddY(0)}Z`;
+  const startY = y(v[0]);
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Equity curve and drawdown">
+    ${oosIdx > 0 ? `<rect x="${x(oosIdx)}" y="${P.t}" width="${x(n - 1) - x(oosIdx)}" height="${H - P.t - P.b}" fill="#f5c400" opacity="0.28"/>
+      <text x="${x(oosIdx) + 6}" y="${H - P.b - DDH - 6}" style="fill:#17233a;font-weight:600">held out (out-of-sample)</text>` : ""}
+    <line x1="${P.l}" x2="${W - P.r}" y1="${startY}" y2="${startY}" stroke="#7a8597" stroke-dasharray="4 4"/>
+    <path d="${area}" fill="#b42318" opacity="0.22"/>
+    <path d="${line}" fill="none" stroke="#17233a" stroke-width="2"/>
+    <text x="${P.l - 8}" y="${y(hi) + 4}" text-anchor="end">${money(hi)}</text>
+    <text x="${P.l - 8}" y="${y(lo) + 4}" text-anchor="end">${money(lo)}</text>
+    <text x="${P.l - 8}" y="${ddY(maxDD)}" text-anchor="end">-${(maxDD * 100).toFixed(0)}%</text>
+    <text x="${P.l}" y="${H - 8}">${eq.t[0]}</text>
+    <text x="${W - P.r}" y="${H - 8}" text-anchor="end">${eq.t[n - 1]}</text>
+  </svg>`;
+}
+
+function wfSVG(wf) {
+  const w = wf.windows, W = 520, H = 220, P = { l: 40, r: 10, t: 16, b: 36 };
+  const vals = w.map((x) => x.oos_net_pct), m = Math.max(5, ...vals.map(Math.abs));
+  const bw = (W - P.l - P.r) / w.length, zero = P.t + (H - P.t - P.b) / 2, k = (H - P.t - P.b) / 2 / m;
+  const bars = w.map((x, i) => {
+    const h = Math.abs(x.oos_net_pct) * k, up = x.oos_net_pct >= 0;
+    return `<rect x="${P.l + i * bw + bw * 0.18}" y="${up ? zero - h : zero}" width="${bw * 0.64}" height="${Math.max(1, h)}" fill="${up ? "#23704a" : "#b42318"}"><title>${x.oos_start}..${x.oos_end}: ${pct(x.oos_net_pct)}, PF ${f2(x.oos_pf)}, ${x.oos_trades} trades</title></rect>
+      <text x="${P.l + i * bw + bw / 2}" y="${H - 18}" text-anchor="middle">W${x.window}</text>
+      <text x="${P.l + i * bw + bw / 2}" y="${H - 5}" text-anchor="middle">${x.oos_start.slice(0, 7)}</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Out-of-sample return per walk-forward window">
+    <line x1="${P.l}" x2="${W - P.r}" y1="${zero}" y2="${zero}" stroke="#17233a"/>
+    <text x="${P.l - 6}" y="${P.t + 8}" text-anchor="end">+${m.toFixed(0)}%</text>
+    <text x="${P.l - 6}" y="${H - P.b}" text-anchor="end">-${m.toFixed(0)}%</text>${bars}</svg>`;
+}
+
+function heatSVG(h) {
+  const cw = 46, chh = 30, L = 64, T = 10, W = L + h.xs.length * cw + 10, H = T + h.ys.length * chh + 40;
+  const all = h.z.flat().filter((v, i) => v !== null && !(h.n && h.n.flat()[i] < h.min_trades)), lo = Math.min(...all, 0.5), hi = Math.max(...all, 1.5);
+  const col = (v) => {
+    if (v === null) return "#e3e8e1";
+    if (v < 1) return `rgba(180,35,24,${0.15 + 0.55 * (1 - Math.max(v, lo) / 1)})`;
+    return `rgba(23,35,58,${0.12 + 0.75 * ((v - 1) / ((hi - 1) || 1))})`;
+  };
+  let cells = "";
+  h.ys.forEach((yv, r) => h.xs.forEach((xv, c) => {
+    const v = h.z[r][c], few = h.n && h.n[r][c] !== null && h.n[r][c] < h.min_trades, best = h.best[0] == xv && h.best[1] == yv;
+    cells += `<rect x="${L + c * cw}" y="${T + (h.ys.length - 1 - r) * chh}" width="${cw - 2}" height="${chh - 2}" fill="${few ? "url(#thin)" : col(v)}" ${best ? 'stroke="#f5c400" stroke-width="4"' : ""}><title>${h.x}=${xv}, ${h.y}=${yv}: ${v === null ? "not sampled" : `PF ${v} on ${h.n ? h.n[r][c] : "?"} trades${few ? ", too few to count" : ""}`}</title></rect>`;
+    if (v !== null && !few) cells += `<text x="${L + c * cw + cw / 2 - 1}" y="${T + (h.ys.length - 1 - r) * chh + chh / 2 + 3}" text-anchor="middle" style="fill:${v > (1 + hi) / 2 ? "#eef1ec" : "#17233a"}">${v.toFixed(1)}</text>`;
+  }));
+  const xl = h.xs.map((xv, c) => `<text x="${L + c * cw + cw / 2}" y="${H - 22}" text-anchor="middle">${xv}</text>`).join("");
+  const yl = h.ys.map((yv, r) => `<text x="${L - 6}" y="${T + (h.ys.length - 1 - r) * chh + chh / 2 + 3}" text-anchor="end">${yv}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Sweep heatmap of in-sample profit factor" style="max-width:${W}px">
+    <defs><pattern id="thin" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="#e3e8e1"/><line x1="0" y1="0" x2="0" y2="6" stroke="#7a8597" stroke-width="1.5"/></pattern></defs>${cells}${xl}${yl}
+    <text x="${L + (h.xs.length * cw) / 2}" y="${H - 4}" text-anchor="middle" style="font-weight:600">${esc(h.x)}</text>
+    <text x="12" y="${T + (h.ys.length * chh) / 2}" transform="rotate(-90 12 ${T + (h.ys.length * chh) / 2})" text-anchor="middle" style="font-weight:600">${esc(h.y)}</text></svg>`;
+}
+
+function metricsTable(g) {
+  const rows = [["Trades", "trades", (v) => v], ["Net return", "net_profit_pct", pct], ["Profit factor", "profit_factor", f2],
+    ["Win rate", "win_rate_pct", (v) => `${f2(v)}%`], ["Max drawdown", "max_drawdown_pct", (v) => `${f2(v)}%`], ["Sharpe", "sharpe_ratio", f2]];
+  return `<table><thead><tr><th></th><th>In-sample</th><th>Out-of-sample</th></tr></thead><tbody>${rows.map(([l, k, f]) =>
+    `<tr><td>${l}</td><td>${f(g.is[k])}</td><td>${g.oos && g.oos[k] !== undefined ? f(g.oos[k]) : "–"}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function stamp(c) {
+  const led = ledgerFor(c.ref);
+  if (led) {
+    const word = { PROMOTE: "Promoted", KILL: "Killed", PARK: "Parked" }[led.verdict] || led.verdict;
+    const cls = { PROMOTE: "pass", KILL: "fail", PARK: "park" }[led.verdict] || "none";
+    return `<div class="stamp ${cls} thump" role="img" aria-label="Verdict ${word}">${word}<small>by ${esc(led.decided_by)}, ${esc(led.created_at.slice(0, 10))}</small></div>`;
+  }
+  if (c.gates) {
+    const ok = c.gates.verdict === "PASS";
+    return `<div class="stamp ${ok ? "pass" : "fail"} thump">${ok ? "Cleared" : "Failed"} ${c.gates.passed_count} of 6<small>awaiting a human verdict</small></div>`;
+  }
+  return `<div class="stamp none thump">Untested</div>`;
+}
+
+function renderCase(c) {
+  const m = c.market || {}, p = c.period || {};
+  let html = `<div class="head"><div><h2>${esc(c.id)} v${c.version}</h2><div class="name">${esc(c.name)}</div>
+    <div class="sub">${esc(m.tv_symbol || m.symbol)} ${esc(m.timeframe)}, ${esc(p.start)} to ${esc(p.end)}, ${Math.round((p.oos_fraction || 0) * 100)}% held out${c.origin === "example" ? ", bundled example" : ""}</div>`;
+  if (c.gates) {
+    const src = String(c.gates.params_source || "");
+    const from = src.startsWith("sweep") ? "the best combo of the latest sweep" : src === "explicit" ? "parameters set by hand" : "the spec defaults";
+    html += `<div class="cand">Audited ${esc(Object.entries(c.gates.params).map(([k, v]) => `${k} ${v}`).join(", "))}, <b>${from}</b></div>`;
+  }
+  html += `</div>${stamp(c)}</div>`;
+  const led = ledgerFor(c.ref);
+  if (led && led.note) html += `<p class="note">“${esc(led.note)}”</p>`;
+
+  if (!c.gates) {
+    html += `<section class="block"><div class="empty"><strong>Not reviewed yet.</strong> In the room, post <code>@backtester ${esc(c.ref)} ready</code>.
+      From a terminal: <code>stratlab sweep ${esc(c.ref)}</code>, then <code>stratlab gates ${esc(c.ref)}</code>, then <code>stratlab ui</code>.</div></section>`;
+  } else {
+    html += `<section class="block"><h3>The Skeptic's review <span>${c.gates.passed_count} of 6 gates passed, thresholds from the Lab Charter</span></h3><div class="gates">${gateView(c)}</div></section>`;
+    if (c.equity) html += `<section class="block"><h3>Equity at the audited parameters <span>full period, starting ${money(c.equity.v[0])}; red is drawdown</span></h3>${equitySVG(c.equity)}</section>`;
+    html += `<section class="block two"><div><h3 style="font-size:24px;border-bottom:2px solid var(--ink);padding-bottom:4px;margin-bottom:14px">Performance</h3>${metricsTable(c.gates)}</div><div>`;
+    if (c.walkforward && c.walkforward.windows && c.walkforward.windows.length) {
+      html += `<h3 style="font-size:24px;border-bottom:2px solid var(--ink);padding-bottom:4px;margin-bottom:14px">Walk-forward</h3>${wfSVG(c.walkforward)}
+        <p class="note">Each bar is a 6-month window traded blind with parameters picked on the 24 months before it. Efficiency ${f2(c.walkforward.walk_forward_efficiency)}.</p>`;
+    }
+    html += `</div></section>`;
+    const r = c.robust;
+    if (r) {
+      const nb = r.neighbourhood;
+      html += `<section class="block"><h3>Stress tests</h3><div class="stress">
+        <div><strong>Monte Carlo</strong>${r.monte_carlo.n_simulations} reshuffles of ${r.monte_carlo.n_trades} trades. 95th percentile drawdown ${f2(r.monte_carlo.pct_95th_max_drawdown)}%, 5th percentile ending equity ${money(r.monte_carlo.pct_5th_final_equity)}.</div>
+        <div><strong>${r.cost_stress.multiplier}x costs</strong>Commission ${r.cost_stress.stressed_commission_pct}% and ${r.cost_stress.stressed_slippage_ticks} ticks of slippage leave a full-period profit factor of ${f2(r.cost_stress.full_period_pf)}.</div>
+        <div><strong>Neighbours</strong>${nb.stability_ratio === null ? "No tunable parameters, so nothing to perturb." : `${nb.tested_neighbours} one-step neighbours have a median in-sample PF of ${f2(nb.median_neighbour_pf)} against ${f2(nb.best_pf)} for the candidate.`}</div>
+      </div></section>`;
+    }
+  }
+  if (c.heatmap) {
+    html += `<section class="block"><h3>Parameter sweep <span>${c.heatmap.evaluated} of ${c.heatmap.grid} combos, in-sample profit factor; yellow outline is the pick, hatched cells had fewer than ${c.heatmap.min_trades} trades</span></h3>${heatSVG(c.heatmap)}
+      <p class="note">An island of dark cells surrounded by red is what overfitting looks like. A broad plateau is what you want.</p></section>`;
+  }
+  html += `<section class="block"><h3>TradingView parity</h3>`;
+  if (c.parity) {
+    const pr = c.parity;
+    html += `<p class="note"><strong class="${pr.status === "PASS" ? "v-PROMOTE" : "v-KILL"}">${pr.status}</strong>: ${pr.matched_entries_count} of ${pr.tv_trades} TradingView entries matched within one bar (${pr.matched_entries_pct}%, target 95%); net profit drift ${pr.net_profit_diff_pct}% (target 5%).</p>`;
+  } else {
+    html += `<p class="note">Not compared yet. Paste the generated Pine into TradingView, export the List of Trades with the chart in UTC, then run <code>stratlab parity ${esc(c.ref)} trades.csv</code>.</p>`;
+  }
+  html += `</section><section class="block"><h3>Source</h3><details><summary>StrategySpec YAML</summary><pre>${esc(c.spec_yaml)}</pre></details>`;
+  if (c.pine) html += `<details><summary>Generated Pine Script v6</summary><pre>${esc(c.pine)}</pre></details>`;
+  html += `</section>`;
+  return html;
+}
+
+function tally(c) {
+  if (!c.gates) return `<span class="tally" aria-label="not reviewed">${"<i></i>".repeat(6)}</span>`;
+  return `<span class="tally" aria-label="${c.gates.passed_count} of 6 gates passed">${GATES.map(([k]) => `<i class="${c.gates.gates[k].pass ? "p" : "f"}"></i>`).join("")}</span>`;
+}
+
+function selectCase(ref, focus) {
+  const c = DATA.cases.find((x) => x.ref === ref) || DATA.cases[0];
+  if (!c) return;
+  document.querySelectorAll(".rail button").forEach((b) => b.setAttribute("aria-current", b.dataset.ref === c.ref ? "true" : "false"));
+  $("#sheet").innerHTML = renderCase(c);
+  history.replaceState(null, "", `#${c.ref}`);
+  if (focus) $("#sheet").focus?.();
+}
+
+function renderLedger() {
+  const d = DATA.digest, rows = DATA.ledger || [];
+  let html = `<h2>Ledger</h2>`;
+  if (!rows.length) return html + `<div class="empty" style="margin-top:18px">No verdicts yet. When a human replies <code>promote</code>, <code>kill</code> or <code>park</code> in #lab, the Scribe records it here.</div>`;
+  html += `<p class="note">${d.decisions} decisions on ${d.specs.length} spec versions: ${d.promoted} promoted, ${d.killed} killed, ${d.parked} parked.${d.most_common_failure ? ` The gate that fails most often is ${esc(d.most_common_failure.replace(/_/g, " "))}.` : ""}</p>`;
+  html += `<table class="ledger" style="margin-top:18px"><thead><tr><th>Date</th><th>Spec</th><th>Verdict</th><th>By</th><th class="n">OOS PF</th><th class="n">OOS max DD</th><th>Failed gates</th><th>Why</th></tr></thead><tbody>`;
+  html += rows.slice().reverse().map((e) => `<tr><td>${esc(e.created_at.slice(0, 10))}</td><td style="white-space:nowrap"><a href="#${esc(e.spec_id)}@v${e.version}" data-ref="${esc(e.spec_id)}@v${e.version}">${esc(e.spec_id)} v${e.version}</a></td>
+    <td class="v-${esc(e.verdict)}">${esc(e.verdict.toLowerCase())}</td><td>${esc(e.decided_by)}</td><td class="n">${f2(e.oos_pf)}</td><td class="n">${e.oos_max_dd == null ? "–" : f2(e.oos_max_dd) + "%"}</td>
+    <td>${esc((e.failed_gates || "None").replace(/_/g, " "))}</td><td>${esc(e.note)}</td></tr>`).join("");
+  return html + `</tbody></table>`;
+}
+
+function renderCharter() {
+  const c = DATA.charter;
+  const items = [
+    ["G1 Sample size", `At least ${c.g1_sample_size.min_is_trades} in-sample and ${c.g1_sample_size.min_oos_trades} out-of-sample trades.`],
+    ["G2 Out-of-sample", `Profit factor on held-out data of at least ${c.g2_out_of_sample.min_oos_pf}, and at least ${c.g2_out_of_sample.min_oos_is_pf_ratio} of the in-sample profit factor.`],
+    ["G3 Walk-forward", `Efficiency of at least ${c.g3_walk_forward.min_wfe} and at least ${c.g3_walk_forward.min_pct_profitable_windows}% of blind windows profitable (${c.walk_forward.is_months}-month fit, ${c.walk_forward.oos_months}-month test).`],
+    ["G4 Stability", `One step either way on each tunable parameter keeps a median in-sample profit factor of at least ${c.g4_stability.min_neighbour_pf_ratio}x the candidate's.`],
+    ["G5 Costs", `With ${c.g5_costs.cost_multiplier}x commission and slippage, the full-period profit factor stays at or above ${c.g5_costs.min_stressed_pf}.`],
+    ["G6 Tail risk", `Across ${c.g6_tail_risk.mc_runs} reshuffles of the trades, the 95th percentile drawdown stays within ${c.g6_tail_risk.max_drawdown_limit_pct * c.g6_tail_risk.mc_drawdown_multiple}% and the 5th percentile ending equity beats the starting capital.`],
+  ];
+  return `<h2>Lab Charter</h2><p class="note">The bar every strategy has to clear before a human is asked to promote it. The candidate is the best in-sample combo from the latest sweep, the version a trader would actually ship. Edit <code>~/stratlab-home/charter.yaml</code> to change a threshold.</p>
+    <div class="charter">${items.map(([t, d]) => `<div><h3>${t}</h3><p class="note">${esc(d)}</p></div>`).join("")}</div>`;
+}
+
+function showTab(name) {
+  ["cases", "ledger", "charter"].forEach((t) => {
+    $(`#tab-${t}`).setAttribute("aria-selected", t === name ? "true" : "false");
+    $(`#view-${t}`).hidden = t !== name;
+  });
+}
+
+function boot() {
+  if (!DATA) { $("#sheet").innerHTML = `<div class="empty">No data embedded. Build this page with <code>stratlab ui</code>.</div>`; return; }
+  $("#meta").innerHTML = `Built ${esc(DATA.generated)}<br>StratLab v${esc(DATA.version)}, ${DATA.cases.length} spec versions`;
+  $("#rail").innerHTML = DATA.cases.map((c) => `<button data-ref="${esc(c.ref)}"><span class="ref">${esc(c.id)} v${c.version}</span>${tally(c)}<span class="nm">${esc(c.name)}</span></button>`).join("");
+  $("#rail").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) selectCase(b.dataset.ref); });
+  $("#view-ledger").innerHTML = renderLedger();
+  $("#view-ledger").addEventListener("click", (e) => { const a = e.target.closest("a[data-ref]"); if (a) { e.preventDefault(); showTab("cases"); selectCase(a.dataset.ref); } });
+  $("#view-charter").innerHTML = renderCharter();
+  ["cases", "ledger", "charter"].forEach((t) => $(`#tab-${t}`).addEventListener("click", () => showTab(t)));
+  const want = decodeURIComponent(location.hash.slice(1));
+  const firstReviewed = DATA.cases.find((c) => c.gates);
+  selectCase(want || (firstReviewed ? firstReviewed.ref : DATA.cases[0]?.ref));
+}
+boot();
+</script>
+</body>
+</html>

@@ -1,107 +1,113 @@
-"""Parser for TradingView Strategy Tester 'List of Trades' CSV exports."""
+"""Parser for TradingView Strategy Tester "List of Trades" CSV exports.
+
+TradingView has changed these headers over time ("Profit USD" vs "Net P&L USDT", "Contracts"
+vs "Position size (qty)", "Date/Time" vs "Date and time"), so columns are found by name, and
+an export we cannot read fails with the headers we saw. Trades still open at the end of the
+export (exit signal "Open") are skipped, since the engine does not count them either.
+
+Set the chart timezone to UTC before exporting: the engine's timestamps are UTC.
+"""
+
+from __future__ import annotations
 
 from pathlib import Path
 
 import pandas as pd
 
+REQUIRED = ("trade number", "type", "date/time", "price")
 
-def _find_column(columns: list[str], keywords: list[str]) -> str | None:
-    """Find a column that matches any keyword in keywords (case-insensitive)."""
+
+def _pick(columns: list[str], include: tuple[str, ...], exclude: tuple[str, ...] = ()) -> str | None:
     for col in columns:
         low = col.lower().strip()
-        for kw in keywords:
-            if kw.lower() in low:
-                return col
+        if any(k in low for k in include) and not any(x in low for x in exclude):
+            return col
     return None
 
 
+def detect_columns(columns: list[str]) -> dict[str, str | None]:
+    return {
+        "trade": _pick(columns, ("trade #", "trade number", "trade no")) or next((c for c in columns if c.strip().lower() in ("trade", "#")), None),
+        "type": _pick(columns, ("type",)),
+        "signal": _pick(columns, ("signal",)),
+        "datetime": _pick(columns, ("date/time", "date and time", "datetime", "date", "time")),
+        "price": _pick(columns, ("price",)),
+        "qty": _pick(columns, ("position size (qty)", "contracts", "quantity", "qty", "shares"), ("value",)),
+        "profit": _pick(columns, ("net p&l", "p&l", "profit"), ("%", "cum", "run-up", "drawdown")),
+    }
+
+
+def _num(val) -> float:
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).replace("−", "-").replace("$", "").replace(",", "").replace("%", "").strip()
+    for unit in ("USDT", "USDC", "USD", "BTC"):
+        s = s.replace(unit, "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
 def parse_tv_trades_csv(csv_path: Path | str) -> pd.DataFrame:
-    """Parse TradingView List of Trades CSV export into normalized DataFrame."""
+    """Return one row per closed trade: trade_num, direction, entry/exit time and price, qty, profit."""
     p = Path(csv_path)
     if not p.exists():
         raise FileNotFoundError(f"TradingView trades CSV not found: {p}")
-
-    df_raw = pd.read_csv(p)
-    cols = list(df_raw.columns)
-
-    trade_num_col = _find_column(cols, ["trade #", "trade number", "trade", "#"])
-    type_col = _find_column(cols, ["type", "action", "signal"])
-    datetime_col = _find_column(cols, ["date/time", "date and time", "date", "time"])
-    price_col = _find_column(cols, ["price", "price usd", "fill price"])
-    contracts_col = _find_column(cols, ["contracts", "shares", "size", "qty", "amount"])
-    profit_col = _find_column(cols, ["profit usd", "profit", "net profit", "pnl"])
-
-    if not trade_num_col or not datetime_col or not price_col:
+    raw = pd.read_csv(p, encoding="utf-8-sig")
+    cols = [str(c) for c in raw.columns]
+    found = detect_columns(cols)
+    missing = [name for name, key in zip(REQUIRED, ("trade", "type", "datetime", "price")) if not found[key]]
+    if missing:
         raise ValueError(
-            f"Unable to detect required TradingView trade headers in {cols}. "
-            f"Found: trade_num={trade_num_col}, datetime={datetime_col}, price={price_col}"
+            f"Not a TradingView 'List of Trades' export: missing {', '.join(missing)} column(s). "
+            f"Headers seen: {cols}. Export it from Strategy Tester > List of Trades > Export."
         )
 
-    # Clean numeric columns
-    def clean_num(val):
-        if pd.isna(val):
-            return 0.0
-        if isinstance(val, (int, float)):
-            return float(val)
-        s = str(val).replace("$", "").replace(",", "").replace("%", "").strip()
-        try:
-            return float(s)
-        except ValueError:
-            return 0.0
-
-    df_raw[price_col] = df_raw[price_col].apply(clean_num)
-    df_raw[datetime_col] = pd.to_datetime(df_raw[datetime_col])
-
-    # Check if single-row or two-rows per trade
-    # If type_col has 'Entry' and 'Exit', group by trade_num
+    raw[found["datetime"]] = pd.to_datetime(raw[found["datetime"]])
+    types = raw[found["type"]].astype(str).str.lower()
     trades = []
-    if type_col and any("entry" in str(x).lower() for x in df_raw[type_col]):
-        # Two rows per trade
-        grouped = df_raw.groupby(trade_num_col)
-        for t_id, group in grouped:
-            entry_rows = group[group[type_col].str.lower().str.contains("entry")]
-            exit_rows = group[group[type_col].str.lower().str.contains("exit")]
+    for t_id, group in raw.groupby(found["trade"], sort=False):
+        g_types = types.loc[group.index]
+        entry = group[g_types.str.contains("entry")]
+        exit_ = group[g_types.str.contains("exit")]
+        if entry.empty or exit_.empty:
+            continue
+        e, x = entry.iloc[0], exit_.iloc[0]
+        if found["signal"] and str(x[found["signal"]]).strip().lower() == "open":
+            continue
+        qty = _num(e[found["qty"]]) if found["qty"] else 0.0
+        e_px, x_px = _num(e[found["price"]]), _num(x[found["price"]])
+        trades.append({
+            "trade_num": int(_num(t_id)),
+            "direction": "short" if "short" in str(e[found["type"]]).lower() else "long",
+            "entry_time": e[found["datetime"]],
+            "entry_price": e_px,
+            "exit_time": x[found["datetime"]],
+            "exit_price": x_px,
+            "exit_signal": str(x[found["signal"]]) if found["signal"] else "",
+            "qty": qty,
+            "profit": _num(x[found["profit"]]) if found["profit"] else (x_px - e_px) * qty,
+        })
+    if not trades:
+        return pd.DataFrame(columns=["trade_num", "direction", "entry_time", "entry_price", "exit_time",
+                                     "exit_price", "exit_signal", "qty", "profit"])
+    return pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
 
-            if not entry_rows.empty and not exit_rows.empty:
-                entry_row = entry_rows.iloc[0]
-                exit_row = exit_rows.iloc[0]
 
-                direction = "long" if "long" in str(entry_row[type_col]).lower() else "short"
-                entry_t = entry_row[datetime_col]
-                entry_px = entry_row[price_col]
-                exit_t = exit_row[datetime_col]
-                exit_px = exit_row[price_col]
-                qty = clean_num(entry_row[contracts_col]) if contracts_col else 1.0
-                profit = clean_num(exit_row[profit_col]) if profit_col else (exit_px - entry_px) * qty
-
-                trades.append({
-                    "trade_num": int(t_id),
-                    "direction": direction,
-                    "entry_time": entry_t,
-                    "entry_price": entry_px,
-                    "exit_time": exit_t,
-                    "exit_price": exit_px,
-                    "qty": qty,
-                    "profit": profit,
-                })
-    else:
-        # One row per trade or chronological trades
-        for idx, row in df_raw.iterrows():
-            t_id = row[trade_num_col] if trade_num_col else idx + 1
-            direction = "long"
-            if type_col and "short" in str(row[type_col]).lower():
-                direction = "short"
-
-            trades.append({
-                "trade_num": int(clean_num(t_id)),
-                "direction": direction,
-                "entry_time": row[datetime_col],
-                "entry_price": row[price_col],
-                "exit_time": row[datetime_col],
-                "exit_price": row[price_col],
-                "qty": clean_num(row[contracts_col]) if contracts_col else 1.0,
-                "profit": clean_num(row[profit_col]) if profit_col else 0.0,
-            })
-
-    result_df = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
-    return result_df
+def write_tv_style_csv(trades: pd.DataFrame, path: Path | str, currency: str = "USDT") -> Path:
+    """Write engine trades in TradingView's export layout (used by the matcher self-test)."""
+    rows = []
+    for _, t in trades.iterrows():
+        n = int(t["trade_num"])
+        rows.append({"Trade #": n, "Type": "Exit long", "Date/Time": t["exit_time"], "Signal": t.get("reason", ""),
+                     f"Price {currency}": t["exit_price"], "Position size (qty)": t["qty"],
+                     f"Net P&L {currency}": t["pnl"], "Net P&L %": t.get("return_pct", 0.0)})
+        rows.append({"Trade #": n, "Type": "Entry long", "Date/Time": t["entry_time"], "Signal": "Long",
+                     f"Price {currency}": t["entry_price"], "Position size (qty)": t["qty"],
+                     f"Net P&L {currency}": "", "Net P&L %": ""})
+    out = Path(path)
+    pd.DataFrame(rows).to_csv(out, index=False)
+    return out

@@ -1,0 +1,7 @@
+Trade #,Type,Date/Time,Signal,Price USDT,Position size (qty),Position size (value),Net P&L USDT,Net P&L %,Run-up USDT,Run-up %,Drawdown USDT,Drawdown %,Cumulative P&L USDT,Cumulative P&L %
+3,Exit long,2024-03-04 12:00,Open,63000.00,0.15,9450.00,450.00,4.99,500.00,5.5,-120.00,-1.3,620.00,6.2
+3,Entry long,2024-03-01 08:00,Long,60000.00,0.15,9000.00,,,,,,,,
+2,Exit long,2024-02-10 04:00,Exit,52500.50,0.2,10500.10,-210.40,-2.03,90.00,0.9,-260.00,-2.5,170.00,1.7
+2,Entry long,2024-02-05 16:00,Long,53500.00,0.2,10700.00,,,,,,,,
+1,Exit long,2024-01-12 00:00,Exit,46200.00,0.22,10164.00,380.40,3.92,410.00,4.2,-55.00,-0.6,380.40,3.8
+1,Entry long,2024-01-09 20:00,Long,44400.00,0.22,9768.00,,,,,,,,

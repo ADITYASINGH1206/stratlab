@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stratlab"
-version = "0.1.0"
+version = "1.0.0"
 description = "Adversarial trading strategy research desk in Switch"
 readme = "README.md"
 authors = [{ name = "StratLab Team" }]
@@ -51,3 +51,6 @@ ignore = ["E501"]
 pythonpath = ["."]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.setuptools.package-data]
+stratlab = ["research/charter_default.yaml", "ui/*.html"]

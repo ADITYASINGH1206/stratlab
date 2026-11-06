@@ -1,96 +1,128 @@
-"""Promotion Gates evaluator enforcing Lab Charter quantitative standards."""
+"""The six promotion gates of the Lab Charter, applied to the candidate parameter set."""
 
+from __future__ import annotations
+
+import json
+from pathlib import Path
 from typing import Any
 
 from stratlab.engine.backtest import run_backtest
-from stratlab.research.robust import run_robustness_battery
+from stratlab.engine.registry import latest_research_run, save_research_run
+from stratlab.research.charter import load_charter
+from stratlab.research.robust import candidate_params, run_robustness_battery
 from stratlab.research.walkforward import run_walkforward
 from stratlab.spec.models import StrategySpec
+
+GATE_TITLES = {
+    "G1_sample_size": "G1 Sample size",
+    "G2_out_of_sample": "G2 Out-of-sample",
+    "G3_walk_forward": "G3 Walk-forward",
+    "G4_stability": "G4 Stability",
+    "G5_costs": "G5 Costs",
+    "G6_tail_risk": "G6 Tail risk",
+}
 
 
 def evaluate_gates(
     spec: StrategySpec,
-    run_id: str | None = None,
-    charter_min_is_trades: int = 30,
-    charter_min_oos_trades: int = 15,
-    charter_min_oos_pf: float = 1.2,
-    charter_min_pf_ratio: float = 0.6,
-    charter_min_wfe: float = 0.5,
-    charter_min_profitable_windows: float = 60.0,
-    charter_min_stability_ratio: float = 0.8,
-    charter_min_stressed_pf: float = 1.05,
-    charter_max_mc_dd: float = 45.0,
+    param_overrides: dict[str, Any] | None = None,
+    charter_overrides: dict[str, Any] | None = None,
+    reuse_walkforward: bool = True,
+    save: bool = True,
 ) -> dict[str, Any]:
-    """Audit a strategy against all 6 Lab Charter promotion gates."""
-    # 1. Run baseline backtest
-    bt_res = run_backtest(spec, save_run=True)
-    m_is = bt_res["is"]
-    m_oos = bt_res.get("oos", {})
+    """Audit the candidate (explicit params, else latest sweep best, else defaults)."""
+    c = load_charter(overrides=charter_overrides)
+    params, source = candidate_params(spec, param_overrides)
+    bt = run_backtest(spec, param_overrides=params, save_run=True, params_source=source)
+    robust = run_robustness_battery(spec, param_overrides=params, save=save)
+    robust["params_source"] = source
+    wf = latest_research_run("walkforward", spec) if reuse_walkforward else None
+    if wf is None:
+        wf = run_walkforward(spec, save=save)
 
-    # 2. Run robustness battery (Monte Carlo, cost stress, neighbourhood)
-    robust_res = run_robustness_battery(spec, run_id=bt_res["run_id"], save=True)
+    m_is, m_oos = bt["is"], bt["oos"] or {}
+    gates: dict[str, dict[str, Any]] = {}
 
-    # 3. Run walk-forward analysis
-    wf_res = run_walkforward(spec, sweep_budget=20)
-
-    # Check G1: Sample size
-    is_trades = m_is.get("trades", 0)
-    oos_trades = m_oos.get("trades", 0)
-    g1_pass = (is_trades >= charter_min_is_trades) and (oos_trades >= charter_min_oos_trades)
-    g1_detail = f"IS trades: {is_trades} (min {charter_min_is_trades}), OOS trades: {oos_trades} (min {charter_min_oos_trades})"
-
-    # Check G2: Out-of-sample performance
-    is_pf = m_is.get("profit_factor", 0.0)
-    oos_pf = m_oos.get("profit_factor", 0.0)
-    pf_ratio = (oos_pf / is_pf) if is_pf > 0 else 0.0
-    g2_pass = (oos_pf >= charter_min_oos_pf) and (pf_ratio >= charter_min_pf_ratio)
-    g2_detail = f"OOS PF: {oos_pf:.2f} (min {charter_min_oos_pf:.2f}), OOS/IS PF ratio: {pf_ratio:.2f} (min {charter_min_pf_ratio:.2f})"
-
-    # Check G3: Walk-Forward efficiency & consistency
-    wfe = wf_res.get("walk_forward_efficiency", 0.0)
-    pct_prof = wf_res.get("pct_profitable_windows", 0.0)
-    g3_pass = (wfe >= charter_min_wfe) and (pct_prof >= charter_min_profitable_windows)
-    g3_detail = f"WFE: {wfe:.2f} (min {charter_min_wfe:.2f}), Profitable windows: {pct_prof:.1f}% (min {charter_min_profitable_windows:.1f}%)"
-
-    # Check G4: Parameter stability / neighbourhood
-    neigh = robust_res["neighbourhood"]
-    stab_ratio = neigh.get("stability_ratio", 0.0)
-    g4_pass = stab_ratio >= charter_min_stability_ratio
-    g4_detail = f"Median neighbour PF: {neigh.get('median_neighbour_pf', 0.0):.2f} vs Best: {neigh.get('best_pf', 0.0):.2f} (ratio: {stab_ratio:.2f}, min {charter_min_stability_ratio:.2f})"
-
-    # Check G5: Cost stress resilience (2x fees & slippage)
-    cost = robust_res["cost_stress"]
-    stressed_pf = cost.get("in_sample_pf", 0.0)
-    g5_pass = stressed_pf >= charter_min_stressed_pf
-    g5_detail = f"2x costs PF: {stressed_pf:.2f} (min {charter_min_stressed_pf:.2f})"
-
-    # Check G6: Tail risk (Monte Carlo bootstrap)
-    mc = robust_res["monte_carlo"]
-    mc_dd = mc.get("pct_95th_max_drawdown", 100.0)
-    mc_eq = mc.get("pct_5th_final_equity", 0.0)
-    init_cap = spec.risk.initial_capital
-    g6_pass = (mc_dd <= charter_max_mc_dd) and (mc_eq > init_cap)
-    g6_detail = f"MC 95th pct Max DD: {mc_dd:.1f}% (max {charter_max_mc_dd:.1f}%), 5th pct Final Eq: ${mc_eq:.2f} (min ${init_cap:.2f})"
-
-    gates = {
-        "G1_sample_size": {"pass": g1_pass, "detail": g1_detail},
-        "G2_out_of_sample": {"pass": g2_pass, "detail": g2_detail},
-        "G3_walk_forward": {"pass": g3_pass, "detail": g3_detail},
-        "G4_stability": {"pass": g4_pass, "detail": g4_detail},
-        "G5_costs": {"pass": g5_pass, "detail": g5_detail},
-        "G6_tail_risk": {"pass": g6_pass, "detail": g6_detail},
+    t = c["g1_sample_size"]
+    gates["G1_sample_size"] = {
+        "pass": m_is["trades"] >= t["min_is_trades"] and m_oos.get("trades", 0) >= t["min_oos_trades"],
+        "values": {"is_trades": m_is["trades"], "oos_trades": m_oos.get("trades", 0)},
+        "detail": f"IS trades {m_is['trades']} (min {t['min_is_trades']}), OOS trades {m_oos.get('trades', 0)} (min {t['min_oos_trades']})",
     }
 
-    passed_count = sum(1 for g in gates.values() if g["pass"])
-    total_gates = len(gates)
-    all_passed = (passed_count == total_gates)
+    t = c["g2_out_of_sample"]
+    is_pf, oos_pf = m_is["profit_factor"], m_oos.get("profit_factor", 0.0)
+    ratio = round(oos_pf / is_pf, 2) if is_pf > 0 else 0.0
+    gates["G2_out_of_sample"] = {
+        "pass": oos_pf >= t["min_oos_pf"] and ratio >= t["min_oos_is_pf_ratio"],
+        "values": {"oos_pf": oos_pf, "is_pf": is_pf, "ratio": ratio},
+        "detail": f"OOS PF {oos_pf:.2f} (min {t['min_oos_pf']}), OOS/IS PF {ratio:.2f} (min {t['min_oos_is_pf_ratio']})",
+    }
 
-    return {
-        "verdict": "PASS" if all_passed else "FAIL",
-        "passed_count": passed_count,
-        "total_gates": total_gates,
+    t = c["g3_walk_forward"]
+    wfe, prof = wf.get("walk_forward_efficiency", 0.0), wf.get("pct_profitable_windows", 0.0)
+    gates["G3_walk_forward"] = {
+        "pass": wf.get("total_windows", 0) > 0 and wfe >= t["min_wfe"] and prof >= t["min_pct_profitable_windows"],
+        "values": {"wfe": wfe, "pct_profitable_windows": prof, "windows": wf.get("total_windows", 0)},
+        "detail": f"WFE {wfe:.2f} (min {t['min_wfe']}), profitable windows {prof:.0f}% (min {t['min_pct_profitable_windows']}%) over {wf.get('total_windows', 0)} windows",
+    }
+
+    t = c["g4_stability"]
+    nb = robust["neighbourhood"]
+    if nb["stability_ratio"] is None:
+        gates["G4_stability"] = {"pass": True, "values": {"stability_ratio": None},
+                                 "detail": "n/a: no tunable params, nothing to overfit"}
+    else:
+        gates["G4_stability"] = {
+            "pass": nb["stability_ratio"] >= t["min_neighbour_pf_ratio"],
+            "values": {"stability_ratio": nb["stability_ratio"], "best_pf": nb["best_pf"], "median_neighbour_pf": nb["median_neighbour_pf"]},
+            "detail": f"median neighbour PF {nb['median_neighbour_pf']:.2f} vs candidate {nb['best_pf']:.2f}, ratio {nb['stability_ratio']:.2f} (min {t['min_neighbour_pf_ratio']}) over {nb['tested_neighbours']} neighbours",
+        }
+
+    t = c["g5_costs"]
+    stressed = robust["cost_stress"]["full_period_pf"]
+    gates["G5_costs"] = {
+        "pass": stressed >= t["min_stressed_pf"],
+        "values": {"stressed_pf": stressed},
+        "detail": f"PF at {t['cost_multiplier']:g}x fees and slippage {stressed:.2f} (min {t['min_stressed_pf']})",
+    }
+
+    t = c["g6_tail_risk"]
+    mc = robust["monte_carlo"]
+    dd_cap = t["max_drawdown_limit_pct"] * t["mc_drawdown_multiple"]
+    init = spec.risk.initial_capital
+    gates["G6_tail_risk"] = {
+        "pass": mc["n_trades"] > 0 and mc["pct_95th_max_drawdown"] <= dd_cap and mc["pct_5th_final_equity"] > init,
+        "values": {"p95_max_dd": mc["pct_95th_max_drawdown"], "p5_final_equity": mc["pct_5th_final_equity"]},
+        "detail": f"MC 95th pct max DD {mc['pct_95th_max_drawdown']:.1f}% (max {dd_cap:g}%), 5th pct final equity ${mc['pct_5th_final_equity']:,.0f} (must beat ${init:,.0f})",
+    }
+
+    passed = sum(g["pass"] for g in gates.values())
+    failed = [k for k, g in gates.items() if not g["pass"]]
+    audit = {
+        "verdict": "PASS" if not failed else "FAIL",
+        "passed_count": passed,
+        "total_gates": len(gates),
+        "failed": failed,
         "gates": gates,
-        "run_id": bt_res["run_id"],
+        "params": params,
+        "params_source": source,
+        "charter": c,
+        "run_id": bt["run_id"],
+        "backtest_run_id": bt["run_id"],
+        "robust_run_id": robust.get("run_id"),
+        "walkforward_run_id": wf.get("run_id"),
         "spec_id": spec.id,
         "version": spec.version,
+        "spec_name": spec.name,
+        "is": m_is,
+        "oos": m_oos,
     }
+    if save:
+        rid, _ = save_research_run("gates", spec, audit)
+        audit["gates_run_id"] = rid
+        # Also drop a copy next to the backtest run, where the ledger looks for it.
+        Path(bt["run_dir"], "gates.json").write_text(json.dumps(
+            {"gates": [{"name": k, "passed": bool(g["pass"])} for k, g in gates.items()], **{
+                "verdict": audit["verdict"], "gates_run_id": rid}}, indent=2))
+    return audit

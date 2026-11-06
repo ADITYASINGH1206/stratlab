@@ -3,6 +3,7 @@
 import tempfile
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from stratlab.cli import app
@@ -71,32 +72,51 @@ if short_condition
     assert "slow" in spec_dict["indicators"]
 
 
-def test_tv_csv_parser():
-    """Verify parser correctly reads 71 closed trades (142 rows) from TV CSV."""
-    csv_path = Path("fixtures/tv_trades_S-012_v2.csv")
-    df = parse_tv_trades_csv(csv_path)
-    assert len(df) == 71
-    assert "entry_time" in df.columns
-    assert "exit_time" in df.columns
-    assert "profit" in df.columns
+def test_tv_csv_parser_current_headers():
+    """Net P&L / Position size headers, exit-row-first order, and an open trade that is skipped."""
+    df = parse_tv_trades_csv(Path("fixtures/tv_format_sample.csv"))
+    assert list(df["trade_num"]) == [1, 2]
+    assert df.iloc[0]["profit"] == 380.40 and df.iloc[1]["profit"] == -210.40
+    assert df.iloc[0]["entry_price"] == 44400.0 and df.iloc[0]["qty"] == 0.22
 
 
-def test_parity_evaluation():
-    """Verify parity comparison between engine backtest and TV trades CSV."""
-    spec_path = SPEC_DIR / "S-012" / "v2.yaml"
-    val = validate_spec_file(spec_path)
-    assert val.is_valid
-    csv_path = Path("fixtures/tv_trades_S-012_v2.csv")
+def test_tv_csv_parser_unknown_headers(tmp_path):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("a,b,c\n1,2,3\n")
+    with pytest.raises(ValueError, match="Headers seen"):
+        parse_tv_trades_csv(bad)
 
-    report = check_trade_parity(val.spec, csv_path)
+
+def _engine_trades_as_tv_csv(spec, path):
+    from stratlab.engine.runner import active_params, compute_signals, prepare, run_window
+    from stratlab.tv.trades_csv import write_tv_style_csv
+
+    params = active_params(spec)
+    prep = prepare(spec)
+    trades, _, _ = run_window(spec, prep, compute_signals(spec, prep, params), params, prep.start, prep.end)
+    return write_tv_style_csv(trades, path), len(trades)
+
+
+def test_parity_matcher_self_check(tmp_path):
+    """Matcher self-test: the engine's own trades written in TradingView's layout must match 100%.
+
+    This checks the matcher and the parser, not TradingView. Real parity needs a real export.
+    """
+    spec = validate_spec_file(SPEC_DIR / "S-012" / "v2.yaml").spec
+    csv, n = _engine_trades_as_tv_csv(spec, tmp_path / "self.csv")
+    report = check_trade_parity(spec, csv)
     assert report["status"] == "PASS"
-    assert report["engine_trades"] == 71
-    assert report["tv_trades"] == 71
-    assert report["matched_entries_pct"] >= 95.0
-    assert report["net_profit_diff_pct"] <= 5.0
+    assert report["tv_trades"] == n and report["matched_entries_pct"] == 100.0
+    assert report["net_profit_diff_pct"] < 0.1
+    assert "Parity Match Report: [PASS]" in render_parity_report(report)
 
-    rendered = render_parity_report(report)
-    assert "Parity Match Report: [PASS]" in rendered
+
+def test_parity_reports_drift(tmp_path):
+    spec = validate_spec_file(SPEC_DIR / "S-012" / "v2.yaml").spec
+    report = check_trade_parity(spec, Path("fixtures/tv_format_sample.csv"))
+    assert report["status"] == "FAIL"
+    assert report["first_mismatch"]
+    assert "Known drift causes" in render_parity_report(report)
 
 
 def test_cli_pine_generate():
@@ -122,15 +142,9 @@ def test_cli_pine_import():
     assert "Import Succeeded: Strategy" in result.stdout
 
 
-def test_cli_parity():
-    result = runner.invoke(
-        app,
-        [
-            "parity",
-            "S-012@v2",
-            "fixtures/tv_trades_S-012_v2.csv",
-        ],
-    )
+def test_cli_parity(tmp_path):
+    spec = validate_spec_file(SPEC_DIR / "S-012" / "v2.yaml").spec
+    csv, n = _engine_trades_as_tv_csv(spec, tmp_path / "self.csv")
+    result = runner.invoke(app, ["parity", "S-012@v2", str(csv)])
     assert result.exit_code == 0
-    assert "Parity Match Report" in result.stdout
-    assert "Matched Entries: 71/71" in result.stdout
+    assert f"Matched Entries: {n}/{n}" in result.stdout

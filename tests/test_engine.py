@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from stratlab.engine.backtest import run_backtest
 from stratlab.engine.conditions import evaluate_condition_tree
@@ -83,7 +84,7 @@ def test_hand_checked_toy_simulation():
     # Bar 1: Long signal generated on close -> enter bar 2 at open
     # Bar 2: Enter Long at Open 100 + slippage (0.10) = 100.10
     #        Target = 110.11, Stop = 95.095.
-    # Bar 3: High reaches 112 -> Take profit fills at target 110.11 - slippage (0.10) = 110.01
+    # Bar 3: High reaches 112 -> Take profit (a limit order) fills at 110.11; TradingView applies no slippage to limits
     #
     # Bar 4: Long signal generated on close -> enter bar 5 at open
     # Bar 5: Enter Long at Open 100 + slippage = 100.10
@@ -133,7 +134,7 @@ def test_hand_checked_toy_simulation():
     assert t1["entry_bar"] == 2
     assert t1["exit_bar"] == 3
     assert np.isclose(t1["entry_price"], 100.10)
-    assert np.isclose(t1["exit_price"], 100.10 * 1.10 - 0.10)
+    assert np.isclose(t1["exit_price"], 100.10 * 1.10)
     assert t1["reason"] == "TARGET"
 
     # Trade 2: Stop exit
@@ -165,3 +166,70 @@ def test_backtest_s012_v1_under_2_seconds():
     assert duration < 2.0, f"Backtest took {duration:.2f}s, expected < 2.0s"
     assert result["trades_is_count"] > 0
     assert "in_sample" in Path(result["run_dir"]).joinpath("metrics.json").read_text()
+    assert Path(result["run_dir"]).joinpath("equity.csv").exists()
+
+
+def _toy(n=12):
+    ts = pd.date_range("2024-01-01", periods=n, freq="4h")
+    return pd.DataFrame({"timestamp": ts, "open": [100.0] * n, "high": [101.0] * n, "low": [99.0] * n,
+                         "close": [100.0] * n, "volume": [1.0] * n})
+
+
+def test_no_reentry_on_the_bar_a_stop_fills():
+    """A signal on bar k-1 while still in a trade must not refill at bar k's open after an intrabar stop."""
+    df = _toy()
+    df.loc[3, "low"] = 90.0  # stop hit intrabar on bar 3
+    sig = np.zeros(len(df), dtype=bool)
+    sig[1] = True  # enter bar 2
+    sig[2] = True  # still in the trade at bar 2's close: TradingView places no order
+    trades, _ = simulate(df, long_signals=sig, stop_pct=5.0, commission_pct=0.0, slippage_ticks=0)
+    assert len(trades) == 1
+    assert trades.iloc[0]["reason"] == "STOP" and trades.iloc[0]["exit_bar"] == 3
+
+
+def test_stop_needs_an_atr_series():
+    df = _toy()
+    sig = np.zeros(len(df), dtype=bool)
+    sig[1] = True
+    with pytest.raises(ValueError, match="ATR"):
+        simulate(df, long_signals=sig, stop_atr_mult=2.0)
+
+
+def test_ema_of_rsi_is_not_all_nan():
+    """Leading NaNs (an EMA of an RSI) are skipped when seeding, as in Pine."""
+    from stratlab.engine.indicators import ema, rsi, sma
+
+    x = 100 + np.cumsum(np.random.default_rng(1).normal(size=300))
+    r = rsi(x, 14)
+    assert np.isnan(r[13]) and not np.isnan(r[14])
+    e = ema(r, 10)
+    assert np.isnan(e[22]) and not np.isnan(e[23])
+    assert not np.isnan(sma(r, 10)[23])
+
+
+def test_expression_sandbox_rejects_code():
+    from stratlab.engine.indicators import evaluate_expression
+
+    ctx = {"close": np.ones(5), "atr": np.ones(5)}
+    assert np.allclose(evaluate_expression("atr / close * 100", ctx), 100.0)
+    for bad in ("__import__('os').system('echo hi')", "close.__class__", "np.load('x')", "max(close)"):
+        with pytest.raises(ValueError):
+            evaluate_expression(bad, ctx)
+
+
+def test_example_specs_actually_trade():
+    """S-020 compared close with a channel that includes today's high (never true); S-001 never exited."""
+    for ref in ("S-001/v1", "S-020/v1"):
+        spec = validate_spec_file(f"examples/specs/{ref}.yaml").spec
+        res = run_backtest(spec, save_run=False)
+        assert res["is"]["trades"] >= 10, ref
+
+
+def test_out_of_sample_keeps_indicator_warmup():
+    """The OOS window must not lose its first 200 bars to an EMA(200) warm-up."""
+    from stratlab.engine.runner import compute_signals, prepare
+
+    spec = validate_spec_file("examples/specs/S-012/v1.yaml").spec
+    prep = prepare(spec)
+    sig = compute_signals(spec, prep, {k: v.default for k, v in spec.params.items()})
+    assert not np.isnan(sig.ctx["ema"][prep.split])

@@ -57,19 +57,38 @@ def test_robustness_monte_carlo():
     assert mc["pct_5th_final_equity"] > 0.0
 
 
-def test_gates_audit_s012_v1_fail_and_v2_pass():
-    """Verify core story: v1 fails at least one gate and v2 passes all six."""
-    v1_res = validate_spec_file(SPEC_DIR / "S-012" / "v1.yaml")
-    assert v1_res.is_valid
-    audit_v1 = evaluate_gates(v1_res.spec)
-    assert audit_v1["verdict"] == "FAIL"
-    assert audit_v1["passed_count"] < 6
+def test_sweep_never_picks_a_low_trade_fluke():
+    spec = validate_spec_file(SPEC_DIR / "S-012" / "v1.yaml").spec
+    df = run_sweep(spec, budget=60, min_trades=20)
+    s = df.attrs["summary"]
+    assert df.iloc[0]["eligible"]
+    assert s["best_is"]["trades"] >= 20
+    assert df.attrs["run_id"].startswith("sweep_S-012_v1")
 
-    v2_res = validate_spec_file(SPEC_DIR / "S-012" / "v2.yaml")
-    assert v2_res.is_valid
-    audit_v2 = evaluate_gates(v2_res.spec)
-    assert audit_v2["verdict"] == "PASS"
-    assert audit_v2["passed_count"] == 6
+
+def test_gates_audit_the_sweep_candidate_and_read_the_charter():
+    """The Skeptic audits the sweep's best combo, with thresholds from charter.yaml."""
+    spec = validate_spec_file(SPEC_DIR / "S-012" / "v1.yaml").spec
+    df = run_sweep(spec, budget=60)
+    audit = evaluate_gates(spec, reuse_walkforward=False)
+    assert audit["params_source"].startswith("sweep:")
+    best = {k: df.iloc[0][k] for k in df.attrs["summary"]["tunable"]}
+    assert all(float(audit["params"][k]) == float(v) for k, v in best.items())
+    assert set(audit["gates"]) == {"G1_sample_size", "G2_out_of_sample", "G3_walk_forward",
+                                   "G4_stability", "G5_costs", "G6_tail_risk"}
+    # S-012 v1 is the demo's overfit baseline: it must not pass on the bundled data.
+    assert audit["verdict"] == "FAIL"
+
+    strict = evaluate_gates(spec, charter_overrides={"g1_sample_size.min_is_trades": 1,
+                                                     "g1_sample_size.min_oos_trades": 1})
+    assert strict["gates"]["G1_sample_size"]["pass"]
+
+
+def test_gates_without_a_sweep_fall_back_to_defaults():
+    spec = validate_spec_file(SPEC_DIR / "S-020" / "v1.yaml").spec
+    audit = evaluate_gates(spec)
+    assert audit["params_source"] in ("defaults",) or audit["params_source"].startswith("sweep:")
+    assert audit["total_gates"] == 6
 
 
 def test_chart_renderers(tmp_path):

@@ -1,173 +1,230 @@
-"""Pine Script v6 code generation from StrategySpec."""
+"""Pine Script v6 code generation from StrategySpec.
 
+The generated strategy follows the same execution rules as `stratlab.engine.sim`, so the
+TradingView "List of Trades" can be compared trade by trade (`stratlab parity`):
+
+* entries need a flat position at the signal bar's close and fill at the next open;
+* stop/target are set on the bar the entry fills, from `strategy.position_avg_price` and the
+  ATR of the signal bar (`atr[1]`), and the exit order is live from the following bar;
+* a time exit closes after N bars in the trade, an opposite signal closes at the next open;
+* entries are limited to the spec period; an open trade is closed after the period ends.
+"""
+
+from __future__ import annotations
+
+import re
 from typing import Any
 
-from jinja2 import Template
+from jinja2 import Environment
 
+from stratlab.engine.registry import spec_hash
+from stratlab.engine.runner import atr_indicator_name
 from stratlab.spec.models import StrategySpec
 
-
-def _param_ref_to_var(token: str) -> str:
-    """Convert $param_name to param_name."""
-    if isinstance(token, str) and token.startswith("$"):
-        return token[1:]
-    return str(token)
+_OFFSET = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]$")
 
 
-def _condition_to_pine(node: dict[str, Any]) -> str:
-    """Recursively convert condition AST into a Pine Script boolean expression."""
+def _operand(token: Any) -> str:
+    if isinstance(token, bool):
+        raise ValueError("booleans are not valid operands")
+    if isinstance(token, (int, float)):
+        return repr(token)
+    tok = str(token).strip()
+    if tok.startswith("$"):
+        return tok[1:]
+    try:
+        float(tok)
+        return tok
+    except ValueError:
+        pass
+    m = _OFFSET.match(tok)
+    if m:
+        return f"{m.group(1)}[{m.group(2)}]"
+    return tok
+
+
+def _param_ref_to_var(token: Any) -> str:
+    """Kept for the Phase 4 API: `$param` -> `param`."""
+    return _operand(token)
+
+
+def _condition_to_pine(node: dict[str, Any] | None) -> str:
+    """Recursively convert a condition tree into a Pine boolean expression."""
     if not node:
-        return "true"
-
-    op = next(iter(node.keys()))
-    val = node[op]
-
+        return "false"
+    op, val = next(iter(node.items()))
     if op == "all":
-        parts = [_condition_to_pine(sub) for sub in val]
-        return "(" + " and ".join(parts) + ")"
-
+        return "(" + " and ".join(_condition_to_pine(s) for s in val) + ")"
     if op == "any":
-        parts = [_condition_to_pine(sub) for sub in val]
-        return "(" + " or ".join(parts) + ")"
-
+        return "(" + " or ".join(_condition_to_pine(s) for s in val) + ")"
     if op == "not":
-        sub = _condition_to_pine(val)
-        return f"(not {sub})"
-
-    left_str = _param_ref_to_var(val[0])
-    right_str = _param_ref_to_var(val[1])
-
+        return f"(not {_condition_to_pine(val)})"
+    a, b = _operand(val[0]), _operand(val[1])
+    simple = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<=", "eq": "==", "neq": "!="}
+    if op in simple:
+        return f"({a} {simple[op]} {b})"
     if op == "crosses_above":
-        return f"ta.crossover({left_str}, {right_str})"
+        return f"ta.crossover({a}, {b})"
     if op == "crosses_below":
-        return f"ta.crossunder({left_str}, {right_str})"
-    if op == "gt":
-        return f"({left_str} > {right_str})"
-    if op == "lt":
-        return f"({left_str} < {right_str})"
-    if op == "gte":
-        return f"({left_str} >= {right_str})"
-    if op == "lte":
-        return f"({left_str} <= {right_str})"
-    if op == "eq":
-        return f"({left_str} == {right_str})"
-    if op == "neq":
-        return f"({left_str} != {right_str})"
-
-    return f"/* unsupported op {op} */ true"
+        return f"ta.crossunder({a}, {b})"
+    raise ValueError(f"condition '{op}' has no Pine translation")
 
 
-PINE_V6_TEMPLATE = """//@version=6
-// StratLab Generated Strategy: {{ spec.id }} v{{ spec.version }}
-// Name: {{ spec.name }}
-// Market: {{ spec.market.tv_symbol }} ({{ spec.market.timeframe }})
-// Generated automatically by StratLab. Do not hand-edit.
-strategy(
-    title = "{{ spec.id }} v{{ spec.version }}: {{ spec.name }}",
-    shorttitle = "{{ spec.id }}@v{{ spec.version }}",
-    overlay = true,
-    initial_capital = {{ spec.risk.initial_capital }},
-    default_qty_type = strategy.percent_of_equity,
-    default_qty_value = {{ spec.risk.value }},
-    commission_type = strategy.commission.percent,
-    commission_value = {{ spec.costs.commission_pct }},
-    slippage = {{ spec.costs.slippage_ticks }},
-    pyramiding = {{ spec.risk.pyramiding }},
-    process_orders_on_close = false
-)
+def _hoist(node: dict[str, Any] | None, atoms: list[str], prefix: str) -> str:
+    """Like `_condition_to_pine`, but every comparison becomes a global variable.
 
-// === Date Range Filter ===
-inDateRange = time >= timestamp("{{ spec.period.start }}T00:00:00Z") and time <= timestamp("{{ spec.period.end }}T23:59:59Z")
+    Pine v6 evaluates `and`/`or` lazily, so a `ta.crossover` on the right of an `and` would
+    not run on every bar. Hoisting each comparison to its own line keeps the series history
+    intact and silences the compiler's consistency warning.
+    """
+    if not node:
+        return "false"
+    op, val = next(iter(node.items()))
+    if op in ("all", "any"):
+        joiner = " and " if op == "all" else " or "
+        return "(" + joiner.join(_hoist(s, atoms, prefix) for s in val) + ")"
+    if op == "not":
+        return f"(not {_hoist(val, atoms, prefix)})"
+    name = f"{prefix}{len(atoms) + 1}"
+    atoms.append(f"{name} = {_condition_to_pine(node)}")
+    return name
+
+
+def _num(v: Any) -> str:
+    if isinstance(v, str):
+        return _operand(v)
+    f = float(v)
+    return str(int(f)) if f.is_integer() and isinstance(v, int) else repr(f)
+
+
+def _indicator_line(name: str, fn: str, ind) -> str:
+    length = _num(ind.len) if ind.len is not None else "14"
+    src = ind.src or "close"
+    if fn == "expr":
+        return f"{name} = {ind.expr}"
+    if fn == "atr":
+        return f"{name} = ta.atr({length})"
+    if fn in ("highest", "lowest"):
+        return f"{name} = ta.{fn}({ind.src or ('high' if fn == 'highest' else 'low')}, {length})"
+    if fn in ("sma", "ema", "wma", "rma", "rsi"):
+        return f"{name} = ta.{fn}({src}, {length})"
+    raise ValueError(f"indicator '{fn}' has no Pine translation")
+
+
+def _input_line(name: str, p) -> str:
+    vals = [p.default] + list(p.range or [])
+    is_int = all(float(v).is_integer() for v in vals)
+    kind = "int" if is_int else "float"
+    fmt = (lambda v: str(int(v))) if is_int else (lambda v: repr(float(v)))
+    args = [fmt(p.default), f'title="{name}"']
+    if p.range:
+        lo, hi, step = p.range
+        args += [f"minval={fmt(lo)}", f"maxval={fmt(hi)}", f"step={fmt(step)}"]
+    return f"{name} = input.{kind}({', '.join(args)})"
+
+
+TEMPLATE = """//@version=6
+// StratLab {{ spec.id }} v{{ spec.version }} | spec hash {{ hash }}
+// {{ spec.name }} | {{ spec.market.tv_symbol }} {{ spec.market.timeframe }}
+// Generated by StratLab from the StrategySpec. Do not hand-edit: change the spec instead.
+// Research tool, not financial advice.
+strategy("{{ spec.id }} v{{ spec.version }}: {{ spec.name }}", shorttitle="{{ spec.id }}@v{{ spec.version }}", overlay=true,
+     initial_capital={{ spec.risk.initial_capital }}, default_qty_type=strategy.percent_of_equity, default_qty_value={{ spec.risk.value }},
+     commission_type=strategy.commission.percent, commission_value={{ spec.costs.commission_pct }}, slippage={{ spec.costs.slippage_ticks }},
+     pyramiding=0, process_orders_on_close=false, calc_on_every_tick=false)
+
+// === Test window (entries only inside it) ===
+startTs = timestamp("UTC", {{ start[0] }}, {{ start[1] }}, {{ start[2] }}, 0, 0)
+endTs = timestamp("UTC", {{ end[0] }}, {{ end[1] }}, {{ end[2] }}, 23, 59)
+inDateRange = time >= startTs and time <= endTs
 
 // === Inputs ===
-{% for p_name, p_cfg in spec.params.items() %}
-{% if p_cfg.range %}
-{% if p_cfg.range[0] is integer and p_cfg.range[1] is integer and p_cfg.range[2] is integer %}
-{{ p_name }} = input.int({{ p_cfg.default }}, title="{{ p_name }}", minval={{ p_cfg.range[0] }}, maxval={{ p_cfg.range[1] }}, step={{ p_cfg.range[2] }})
-{% else %}
-{{ p_name }} = input.float({{ p_cfg.default }}, title="{{ p_name }}", minval={{ p_cfg.range[0] }}, maxval={{ p_cfg.range[1] }}, step={{ p_cfg.range[2] }})
-{% endif %}
-{% else %}
-{% if p_cfg.default is integer %}
-{{ p_name }} = input.int({{ p_cfg.default }}, title="{{ p_name }}")
-{% else %}
-{{ p_name }} = input.float({{ p_cfg.default }}, title="{{ p_name }}")
-{% endif %}
-{% endif %}
+{% for line in inputs %}
+{{ line }}
 {% endfor %}
 
 // === Indicators ===
-{% for ind_name, ind_cfg in spec.indicators.items() %}
-{% set fn = ind_cfg.fn.lower() %}
-{% if fn == "sma" %}
-{{ ind_name }} = ta.sma({{ ind_cfg.src or "close" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "ema" %}
-{{ ind_name }} = ta.ema({{ ind_cfg.src or "close" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "wma" %}
-{{ ind_name }} = ta.wma({{ ind_cfg.src or "close" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "rma" %}
-{{ ind_name }} = ta.rma({{ ind_cfg.src or "close" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "rsi" %}
-{{ ind_name }} = ta.rsi({{ ind_cfg.src or "close" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "atr" %}
-{{ ind_name }} = ta.atr({{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "highest" %}
-{{ ind_name }} = ta.highest({{ ind_cfg.src or "high" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "lowest" %}
-{{ ind_name }} = ta.lowest({{ ind_cfg.src or "low" }}, {{ ind_cfg.len | replace("$", "") }})
-{% elif fn == "expr" %}
-{{ ind_name }} = {{ ind_cfg.expr }}
-{% endif %}
+{% for line in indicators %}
+{{ line }}
 {% endfor %}
 
-// === Execution State Variables ===
-var float stopPx = na
-var float tpPx = na
-var int entryBarIndex = na
-
-// === Conditions ===
-{% if spec.entry.long %}
-longSignal = inDateRange and {{ long_condition_code }}
-{% else %}
-longSignal = false
+// === Signals (evaluated on bar close) ===
+{% for line in atoms %}
+{{ line }}
+{% endfor %}
+longSignal = inDateRange and {{ long_code }}
+{% if short_code %}
+exitSignal = {{ short_code }}
 {% endif %}
 
-// === Orders & Execution ===
+// === Entry: only when flat at the signal close; fills at the next bar's open ===
 if longSignal and strategy.position_size == 0
     strategy.entry("Long", strategy.long)
-    entryBarIndex := bar_index
-{% if spec.exit.stop and spec.exit.stop.atr_mult %}
-    stopPx := close - ({{ spec.exit.stop.atr_mult | replace("$", "") }} * atr)
-{% elif spec.exit.stop and spec.exit.stop.pct %}
-    stopPx := close * (1.0 - ({{ spec.exit.stop.pct | replace("$", "") }} / 100.0))
-{% else %}
-    stopPx := na
-{% endif %}
-{% if spec.exit.target and spec.exit.target.atr_mult %}
-    tpPx := close + ({{ spec.exit.target.atr_mult | replace("$", "") }} * atr)
-{% elif spec.exit.target and spec.exit.target.pct %}
-    tpPx := close * (1.0 + ({{ spec.exit.target.pct | replace("$", "") }} / 100.0))
-{% else %}
-    tpPx := na
-{% endif %}
 
-{% if spec.exit.time and spec.exit.time.bars %}
-if strategy.position_size > 0 and (bar_index - entryBarIndex) >= {{ spec.exit.time.bars }}
-    strategy.close("Long", comment="Time Exit")
-{% endif %}
+// === Exits ===
+var float stopPx = na
+var float tpPx = na
+var int entryBar = na
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    // entry filled on this bar: levels from the fill price and the signal bar's ATR
+    entryBar := bar_index
+    stopPx := {{ stop_code }}
+    tpPx := {{ target_code }}
 
 if strategy.position_size > 0
-    strategy.exit("Exit Long", from_entry="Long", stop=stopPx, limit=tpPx)
+{% if has_levels %}
+    strategy.exit("Exit", from_entry="Long", stop=stopPx, limit=tpPx)
+{% endif %}
+{% if time_bars %}
+    if bar_index - entryBar >= {{ time_bars }} - 1
+        strategy.close("Long", comment="Time exit")
+{% endif %}
+{% if short_code %}
+    if exitSignal
+        strategy.close("Long", comment="Opposite signal")
+{% endif %}
+    if time > endTs
+        strategy.close("Long", comment="End of test window")
 
 if strategy.position_size == 0
     stopPx := na
     tpPx := na
-    entryBarIndex := na
 """
+
+_ENV = Environment(trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True)
 
 
 def generate_pine_script(spec: StrategySpec) -> str:
-    """Render StrategySpec into valid Pine Script v6 strategy code."""
-    long_code = _condition_to_pine(spec.entry.long) if spec.entry.long else "false"
-    template = Template(PINE_V6_TEMPLATE)
-    return template.render(spec=spec, long_condition_code=long_code)
+    """Render a StrategySpec into a Pine Script v6 strategy."""
+    atr_name = atr_indicator_name(spec)
+
+    def level(cfg, sign: str) -> str:
+        if cfg is None:
+            return "na"
+        if cfg.atr_mult is not None:
+            return f"strategy.position_avg_price {sign} {_num(cfg.atr_mult)} * {atr_name}[1]"
+        if cfg.pct is not None:
+            return f"strategy.position_avg_price * (1 {sign} {_num(cfg.pct)} / 100.0)"
+        return "na"
+
+    time_bars = spec.exit.time.bars if spec.exit.time else None
+    atoms: list[str] = []
+    long_code = _hoist(spec.entry.long, atoms, "longCond")
+    short_code = _hoist(spec.entry.short, atoms, "exitCond") if spec.exit.opposite_signal and spec.entry.short else None
+    start = str(spec.period.start).split("-")
+    end = str(spec.period.end).split("-")
+    return _ENV.from_string(TEMPLATE).render(
+        spec=spec,
+        hash=spec_hash(spec),
+        start=[int(x) for x in start],
+        end=[int(x) for x in end],
+        inputs=[_input_line(k, p) for k, p in spec.params.items()],
+        indicators=[_indicator_line(k, i.fn.lower(), i) for k, i in spec.indicators.items()],
+        atoms=atoms,
+        long_code=long_code,
+        short_code=short_code,
+        has_levels=bool(spec.exit.stop or spec.exit.target),
+        stop_code=level(spec.exit.stop, "-"),
+        target_code=level(spec.exit.target, "+"),
+        time_bars=_num(time_bars) if time_bars is not None else None,
+    )

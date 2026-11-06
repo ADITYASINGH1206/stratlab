@@ -1,186 +1,127 @@
-"""Robustness testing: Monte Carlo trade bootstrap, cost stress, and parameter neighbourhood."""
+"""Robustness battery on the candidate parameters: Monte Carlo, cost stress, neighbourhood."""
 
-import json
+from __future__ import annotations
+
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from stratlab.config import get_runs_dir
-from stratlab.engine.backtest import run_backtest
+from stratlab.engine.registry import latest_research_run, save_research_run
+from stratlab.engine.runner import active_params, compute_signals, prepare, run_window
+from stratlab.research.charter import load_charter
+from stratlab.research.sweep import param_grid
 from stratlab.spec.models import StrategySpec
 
 
-def run_monte_carlo_bootstrap(
-    trades_df: pd.DataFrame,
-    initial_capital: float = 10000.0,
-    n_simulations: int = 1000,
-    seed: int = 42,
-) -> dict[str, Any]:
-    """Resample trades with replacement 1,000 times to estimate tail risk."""
+def candidate_params(spec: StrategySpec, overrides: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+    """The parameter set under review, and where it came from.
+
+    1. explicit `--params` overrides, else
+    2. the best combo of the latest sweep of this exact spec (what the Backtester would ship), else
+    3. the spec defaults.
+    """
+    if overrides:
+        return active_params(spec, overrides), "explicit"
+    sweep = latest_research_run("sweep", spec)
+    if sweep and sweep.get("best_params"):
+        return active_params(spec, sweep["best_params"]), f"sweep:{sweep['run_id']}"
+    return active_params(spec), "defaults"
+
+
+def run_monte_carlo_bootstrap(trades_df: pd.DataFrame, initial_capital: float = 10000.0,
+                              n_simulations: int = 1000, seed: int = 42) -> dict[str, Any]:
+    """Resample the per-trade returns with replacement and compound them (100% equity sizing)."""
     if len(trades_df) == 0:
-        return {
-            "n_simulations": n_simulations,
-            "pct_5th_final_equity": initial_capital,
-            "pct_50th_final_equity": initial_capital,
-            "pct_95th_max_drawdown": 0.0,
-        }
-
-    np.random.seed(seed)
-    pnls = trades_df["pnl"].to_numpy()
-    n_trades = len(pnls)
-
-    final_equities = np.empty(n_simulations, dtype=np.float64)
-    max_drawdowns = np.empty(n_simulations, dtype=np.float64)
-
-    for i in range(n_simulations):
-        # Sample trade indices with replacement
-        sampled_indices = np.random.choice(n_trades, size=n_trades, replace=True)
-        sampled_pnls = pnls[sampled_indices]
-
-        # Reconstruct equity curve
-        eq = np.empty(n_trades + 1, dtype=np.float64)
-        eq[0] = initial_capital
-        curr = initial_capital
-        for t in range(n_trades):
-            curr += sampled_pnls[t]
-            eq[t + 1] = max(curr, 0.0)
-
-        final_equities[i] = eq[-1]
-
-        # Max drawdown of sampled curve
-        peaks = np.maximum.accumulate(eq)
-        dds = (peaks - eq) / np.where(peaks > 0, peaks, 1.0) * 100.0
-        max_drawdowns[i] = np.max(dds)
-
-    pct_95th_max_dd = float(np.percentile(max_drawdowns, 95))
-    pct_5th_final_equity = float(np.percentile(final_equities, 5))
-    pct_50th_final_equity = float(np.percentile(final_equities, 50))
-
+        return {"n_simulations": n_simulations, "n_trades": 0, "pct_95th_max_drawdown": 0.0,
+                "pct_5th_final_equity": initial_capital, "pct_50th_final_equity": initial_capital}
+    if "return_pct" in trades_df:
+        rets = trades_df["return_pct"].to_numpy(dtype=np.float64) / 100.0
+    else:  # only currency P&L: turn it into returns on the running equity
+        eq = initial_capital + np.concatenate([[0.0], np.cumsum(trades_df["pnl"].to_numpy(dtype=np.float64))[:-1]])
+        rets = trades_df["pnl"].to_numpy(dtype=np.float64) / eq
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(rets), size=(n_simulations, len(rets)))
+    growth = np.cumprod(1.0 + rets[idx], axis=1)
+    curves = np.hstack([np.ones((n_simulations, 1)), growth]) * initial_capital
+    peaks = np.maximum.accumulate(curves, axis=1)
+    max_dd = ((peaks - curves) / peaks * 100.0).max(axis=1)
+    finals = curves[:, -1]
     return {
         "n_simulations": n_simulations,
-        "pct_95th_max_drawdown": round(pct_95th_max_dd, 2),
-        "pct_5th_final_equity": round(pct_5th_final_equity, 2),
-        "pct_50th_final_equity": round(pct_50th_final_equity, 2),
+        "n_trades": int(len(rets)),
+        "pct_95th_max_drawdown": round(float(np.percentile(max_dd, 95)), 2),
+        "pct_5th_final_equity": round(float(np.percentile(finals, 5)), 2),
+        "pct_50th_final_equity": round(float(np.percentile(finals, 50)), 2),
     }
 
 
-def run_cost_stress_test(
-    spec: StrategySpec,
-    active_params: dict[str, Any],
-) -> dict[str, Any]:
-    """Test strategy resilience with 2x commission and 2x slippage."""
-    stressed_spec = spec.model_copy(deep=True)
-    stressed_spec.costs.commission_pct *= 2.0
-    stressed_spec.costs.slippage_ticks *= 2
-
-    res = run_backtest(stressed_spec, param_overrides=active_params, save_run=False)
-    m_is = res["is"]
-    m_oos = res.get("oos", {})
-
+def run_cost_stress_test(spec: StrategySpec, params: dict[str, Any], multiplier: float = 2.0, prep=None,
+                         sig=None) -> dict[str, Any]:
+    prep = prep or prepare(spec)
+    sig = sig or compute_signals(spec, prep, params)
+    _, _, m_is = run_window(spec, prep, sig, params, prep.start, prep.split, cost_mult=multiplier)
+    _, _, m_oos = run_window(spec, prep, sig, params, prep.split, prep.end, cost_mult=multiplier)
+    _, _, m_full = run_window(spec, prep, sig, params, prep.start, prep.end, cost_mult=multiplier)
     return {
-        "stressed_commission_pct": stressed_spec.costs.commission_pct,
-        "stressed_slippage_ticks": stressed_spec.costs.slippage_ticks,
-        "in_sample_pf": m_is.get("profit_factor", 0.0),
-        "in_sample_net_pct": m_is.get("net_profit_pct", 0.0),
-        "out_of_sample_pf": m_oos.get("profit_factor", 0.0),
-        "out_of_sample_net_pct": m_oos.get("net_profit_pct", 0.0),
+        "multiplier": multiplier,
+        "stressed_commission_pct": spec.costs.commission_pct * multiplier,
+        "stressed_slippage_ticks": spec.costs.slippage_ticks * multiplier,
+        "in_sample_pf": m_is["profit_factor"],
+        "out_of_sample_pf": m_oos["profit_factor"],
+        "full_period_pf": m_full["profit_factor"],
+        "full_period_net_pct": m_full["net_profit_pct"],
     }
 
 
-def run_parameter_neighbourhood_test(
-    spec: StrategySpec,
-    best_params: dict[str, Any],
-) -> dict[str, Any]:
-    """Perturb tunable parameters by +/- 1 step along each axis to verify plateau stability."""
-    tunable_params = {k: v for k, v in spec.params.items() if not v.fixed and v.range is not None}
-    if not tunable_params:
-        return {
-            "tested_neighbours": 0,
-            "median_neighbour_pf": best_params.get("profit_factor", 1.5),
-            "stability_ratio": 1.0,
-        }
-
-    # Evaluate baseline best params
-    baseline_res = run_backtest(spec, param_overrides=best_params, save_run=False)
-    best_pf = baseline_res["is"]["profit_factor"]
-
-    neighbour_pfs = []
-
-    for param_name, cfg in tunable_params.items():
-        min_v, max_v, step = cfg.range
-        curr_val = best_params.get(param_name, cfg.default)
-
-        # Step up
-        val_up = curr_val + step
-        if val_up <= max_v:
-            p_copy = dict(best_params)
-            p_copy[param_name] = int(val_up) if isinstance(step, int) else round(val_up, 4)
-            res_up = run_backtest(spec, param_overrides=p_copy, save_run=False)
-            neighbour_pfs.append(res_up["is"]["profit_factor"])
-
-        # Step down
-        val_down = curr_val - step
-        if val_down >= min_v:
-            p_copy = dict(best_params)
-            p_copy[param_name] = int(val_down) if isinstance(step, int) else round(val_down, 4)
-            res_down = run_backtest(spec, param_overrides=p_copy, save_run=False)
-            neighbour_pfs.append(res_down["is"]["profit_factor"])
-
-    if not neighbour_pfs:
-        neighbour_pfs = [best_pf]
-
-    median_neighbour_pf = float(np.median(neighbour_pfs))
-    stability_ratio = round(median_neighbour_pf / best_pf, 2) if best_pf > 0 else 0.0
-
+def run_parameter_neighbourhood_test(spec: StrategySpec, params: dict[str, Any], prep=None) -> dict[str, Any]:
+    """Move each tunable param one grid step either way and compare in-sample profit factor."""
+    prep = prep or prepare(spec)
+    grid = param_grid(spec)
+    sig = compute_signals(spec, prep, params)
+    _, _, base = run_window(spec, prep, sig, params, prep.start, prep.split)
+    best_pf = base["profit_factor"]
+    if not grid:
+        return {"tested_neighbours": 0, "neighbours": [], "best_pf": best_pf, "median_neighbour_pf": None,
+                "stability_ratio": None, "note": "no tunable params, nothing to perturb"}
+    neighbours = []
+    for name, values in grid.items():
+        cur = params[name]
+        pos = int(np.argmin([abs(v - cur) for v in values]))
+        for j in (pos - 1, pos + 1):
+            if 0 <= j < len(values):
+                p = dict(params)
+                p[name] = values[j]
+                s = compute_signals(spec, prep, p)
+                _, _, m = run_window(spec, prep, s, p, prep.start, prep.split)
+                neighbours.append({"param": name, "value": values[j], "pf": m["profit_factor"], "trades": m["trades"]})
+    pfs = [n["pf"] for n in neighbours]
+    median = float(np.median(pfs)) if pfs else best_pf
     return {
-        "tested_neighbours": len(neighbour_pfs),
-        "neighbour_pfs": neighbour_pfs,
-        "median_neighbour_pf": round(median_neighbour_pf, 2),
+        "tested_neighbours": len(neighbours),
+        "neighbours": neighbours,
         "best_pf": round(best_pf, 2),
-        "stability_ratio": stability_ratio,
+        "median_neighbour_pf": round(median, 2),
+        "stability_ratio": round(median / best_pf, 2) if best_pf > 0 else 0.0,
     }
 
 
-def run_robustness_battery(
-    spec: StrategySpec,
-    run_id: str | None = None,
-    save: bool = True,
-) -> dict[str, Any]:
-    """Execute full robustness suite: Monte Carlo, cost stress, and parameter neighborhood."""
-    # Run backtest to obtain baseline trades
-    res = run_backtest(spec, save_run=True)
-    actual_run_id = run_id or res["run_id"]
-    active_params = res["params"]
-
-    # Load trades from run
-    run_dir = get_runs_dir() / actual_run_id
-    trades_path = run_dir / "trades.csv"
-    if trades_path.exists():
-        trades_df = pd.read_csv(trades_path)
-    else:
-        trades_df = pd.DataFrame()
-
-    # 1. Monte Carlo
-    mc_results = run_monte_carlo_bootstrap(trades_df, initial_capital=spec.risk.initial_capital)
-
-    # 2. Cost Stress
-    cost_results = run_cost_stress_test(spec, active_params)
-
-    # 3. Parameter Neighborhood
-    neigh_results = run_parameter_neighbourhood_test(spec, active_params)
-
-    robust_data = {
-        "run_id": actual_run_id,
-        "spec_id": spec.id,
-        "version": spec.version,
-        "monte_carlo": mc_results,
-        "cost_stress": cost_results,
-        "neighbourhood": neigh_results,
+def run_robustness_battery(spec: StrategySpec, param_overrides: dict[str, Any] | None = None,
+                           save: bool = True, run_id: str | None = None) -> dict[str, Any]:
+    charter = load_charter()
+    params, source = candidate_params(spec, param_overrides)
+    prep = prepare(spec)
+    sig = compute_signals(spec, prep, params)
+    trades, _, _ = run_window(spec, prep, sig, params, prep.start, prep.end)
+    result = {
+        "params": params,
+        "params_source": source,
+        "monte_carlo": run_monte_carlo_bootstrap(trades, spec.risk.initial_capital,
+                                                 n_simulations=int(charter["g6_tail_risk"]["mc_runs"])),
+        "cost_stress": run_cost_stress_test(spec, params, charter["g5_costs"]["cost_multiplier"], prep, sig),
+        "neighbourhood": run_parameter_neighbourhood_test(spec, params, prep),
     }
-
-    if save and run_dir.exists():
-        with open(run_dir / "robust.json", "w", encoding="utf-8") as f:
-            json.dump(robust_data, f, indent=2)
-
-    return robust_data
+    if save:
+        rid, _ = save_research_run("robust", spec, result)
+        result["run_id"] = rid
+    return result

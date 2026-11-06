@@ -1,0 +1,29 @@
+# StratLab promotion gates (the Lab Charter).
+# `stratlab gates` reads $STRATLAB_HOME/charter.yaml (copied from this file on first run).
+# Edit the numbers there; the Skeptic quotes them in every review.
+g1_sample_size:
+  min_is_trades: 30
+  min_oos_trades: 15
+g2_out_of_sample:
+  min_oos_pf: 1.2
+  min_oos_is_pf_ratio: 0.6
+g3_walk_forward:
+  min_wfe: 0.5
+  min_pct_profitable_windows: 60
+g4_stability:
+  min_neighbour_pf_ratio: 0.8
+g5_costs:
+  cost_multiplier: 2.0
+  min_stressed_pf: 1.05
+g6_tail_risk:
+  max_drawdown_limit_pct: 20
+  mc_drawdown_multiple: 1.5
+  mc_runs: 1000
+sweep:
+  min_trades: 20
+walk_forward:
+  is_months: 24
+  oos_months: 6
+  step_months: 6
+  budget: 50
+  min_trades: 8

@@ -1,119 +1,110 @@
-"""Numba-accelerated backtest simulation engine matching TradingView broker emulator."""
+"""Numba-accelerated backtest simulation engine matching TradingView's broker emulator.
+
+Execution model (TradingView defaults, `process_orders_on_close=false`):
+
+* Signals are evaluated on bar close. Market orders (entries, time exits, signal exits)
+  fill at the NEXT bar's open, plus slippage against the trader.
+* An entry order is only placed if the strategy was flat at the close that produced the
+  signal. A position closed intrabar can therefore never be re-entered at that same bar's open.
+* Stop and target levels are computed from the entry fill price and the ATR of the signal
+  bar. They become active on the bar after the entry fill (TradingView places the exit order
+  at the close of the entry bar).
+* Intrabar path: if the open is nearer the high the path is O-H-L-C, otherwise O-L-H-C.
+  A gap through a level fills at the open.
+* Slippage applies to market and stop fills. Limit (target) fills get no slippage, like
+  TradingView.
+* Commission is a percentage of traded value on each side. Long-only, one position at a time.
+"""
 
 import numpy as np
 import pandas as pd
 from numba import njit
 
+REASON_MAP = {1: "STOP", 2: "TARGET", 3: "TIME", 4: "OPPOSITE", 5: "END"}
 
-@njit
+
+@njit(cache=True)
 def run_simulation_numba(
-    open_p: np.ndarray,
-    high_p: np.ndarray,
-    low_p: np.ndarray,
-    close_p: np.ndarray,
-    long_signals: np.ndarray,
-    short_signals: np.ndarray,
-    atr_series: np.ndarray,
-    stop_atr_mult: float,
-    target_atr_mult: float,
-    stop_pct: float,
-    target_pct: float,
-    time_bars: int,
-    opposite_exit: bool,
-    commission_pct: float,
-    slippage_cost: float,
-    initial_capital: float,
+    open_p, high_p, low_p, close_p, long_signals, short_signals, atr_series,
+    stop_atr_mult, target_atr_mult, stop_pct, target_pct, time_bars, opposite_exit,
+    commission_pct, slippage_cost, initial_capital,
 ):
-    """Core simulation loop compiled with Numba njit."""
     n_bars = len(close_p)
-    max_trades = n_bars
-
-    # Pre-allocate output arrays for trade logs
-    t_entry_bar = np.empty(max_trades, dtype=np.int64)
-    t_exit_bar = np.empty(max_trades, dtype=np.int64)
-    t_entry_price = np.empty(max_trades, dtype=np.float64)
-    t_exit_price = np.empty(max_trades, dtype=np.float64)
-    t_direction = np.empty(max_trades, dtype=np.int64)  # 1 for long, -1 for short
-    t_qty = np.empty(max_trades, dtype=np.float64)
-    t_pnl = np.empty(max_trades, dtype=np.float64)
-    t_return_pct = np.empty(max_trades, dtype=np.float64)
-    t_reason = np.empty(max_trades, dtype=np.int64)  # 1=STOP, 2=TARGET, 3=TIME, 4=OPPOSITE, 5=END
-
-    trade_count = 0
-    in_pos = 0  # 0=flat, 1=long
-    entry_bar = 0
-    entry_price = 0.0
-    qty = 0.0
-    stop_price = 0.0
-    target_price = 1e12
-    capital = initial_capital
-
+    t_entry_bar = np.empty(n_bars, dtype=np.int64)
+    t_exit_bar = np.empty(n_bars, dtype=np.int64)
+    t_entry_price = np.empty(n_bars, dtype=np.float64)
+    t_exit_price = np.empty(n_bars, dtype=np.float64)
+    t_direction = np.empty(n_bars, dtype=np.int64)
+    t_qty = np.empty(n_bars, dtype=np.float64)
+    t_pnl = np.empty(n_bars, dtype=np.float64)
+    t_return_pct = np.empty(n_bars, dtype=np.float64)
+    t_reason = np.empty(n_bars, dtype=np.int64)
     equity_curve = np.empty(n_bars, dtype=np.float64)
 
+    trade_count = 0
+    in_pos = 0
+    entry_bar = 0
+    entry_price = 0.0
+    entry_capital = initial_capital
+    qty = 0.0
+    stop_price = -1.0
+    target_price = 1e18
+    capital = initial_capital
+    if n_bars > 0:
+        equity_curve[0] = initial_capital
+
     for i in range(1, n_bars):
-        # 1. Process open position exits on bar i
+        flat_at_prev_close = in_pos == 0
+
+        # 1) exits
         if in_pos == 1:
             exited = False
             exit_px = 0.0
-            reason_code = 0
-
-            # Opposite signal exit at bar open?
+            reason = 0
+            op = open_p[i]
+            hi = high_p[i]
+            lo = low_p[i]
             if opposite_exit and short_signals[i - 1]:
-                exit_px = open_p[i] - slippage_cost
-                reason_code = 4  # OPPOSITE
+                exit_px = op - slippage_cost
+                reason = 4
                 exited = True
-
-            # Time exit at bar open?
             elif time_bars > 0 and (i - entry_bar) >= time_bars:
-                exit_px = open_p[i] - slippage_cost
-                reason_code = 3  # TIME
+                exit_px = op - slippage_cost
+                reason = 3
                 exited = True
-
-            # Intrabar Stop / Limit evaluation via TradingView Broker Emulator path
-            if not exited:
-                op = open_p[i]
-                hi = high_p[i]
-                lo = low_p[i]
-
-                # TV Intrabar rule: if open is closer to high, path is Open -> High -> Low -> Close
-                # Otherwise, Open -> Low -> High -> Close
-                open_nearer_high = (hi - op) < (op - lo)
-
-                if open_nearer_high:
-                    # Check Target (Take Profit) first
-                    if hi >= target_price:
-                        # Filled at limit or gap open
-                        raw_fill = op if op > target_price else target_price
-                        exit_px = raw_fill - slippage_cost
-                        reason_code = 2  # TARGET
-                        exited = True
-                    elif lo <= stop_price:
-                        # Filled at stop or gap open
-                        raw_fill = op if op < stop_price else stop_price
-                        exit_px = raw_fill - slippage_cost
-                        reason_code = 1  # STOP
-                        exited = True
+            elif i > entry_bar:
+                if op <= stop_price:
+                    exit_px = op - slippage_cost
+                    reason = 1
+                    exited = True
+                elif op >= target_price:
+                    exit_px = op
+                    reason = 2
+                    exited = True
                 else:
-                    # Check Stop Loss first
-                    if lo <= stop_price:
-                        raw_fill = op if op < stop_price else stop_price
-                        exit_px = raw_fill - slippage_cost
-                        reason_code = 1  # STOP
-                        exited = True
-                    elif hi >= target_price:
-                        raw_fill = op if op > target_price else target_price
-                        exit_px = raw_fill - slippage_cost
-                        reason_code = 2  # TARGET
-                        exited = True
-
+                    open_nearer_high = (hi - op) < (op - lo)
+                    if open_nearer_high:
+                        if hi >= target_price:
+                            exit_px = target_price
+                            reason = 2
+                            exited = True
+                        elif lo <= stop_price:
+                            exit_px = stop_price - slippage_cost
+                            reason = 1
+                            exited = True
+                    else:
+                        if lo <= stop_price:
+                            exit_px = stop_price - slippage_cost
+                            reason = 1
+                            exited = True
+                        elif hi >= target_price:
+                            exit_px = target_price
+                            reason = 2
+                            exited = True
             if exited:
-                gross_proceeds = qty * exit_px
-                exit_comm = gross_proceeds * commission_pct
-                capital = gross_proceeds - exit_comm
-
-                pnl = capital - (qty * entry_price)
-                return_pct = (exit_px - entry_price) / entry_price * 100.0
-
+                proceeds = qty * exit_px
+                capital = proceeds - proceeds * commission_pct
+                pnl = capital - entry_capital
                 t_entry_bar[trade_count] = entry_bar
                 t_exit_bar[trade_count] = i
                 t_entry_price[trade_count] = entry_price
@@ -121,68 +112,51 @@ def run_simulation_numba(
                 t_direction[trade_count] = 1
                 t_qty[trade_count] = qty
                 t_pnl[trade_count] = pnl
-                t_return_pct[trade_count] = return_pct
-                t_reason[trade_count] = reason_code
+                t_return_pct[trade_count] = pnl / entry_capital * 100.0
+                t_reason[trade_count] = reason
                 trade_count += 1
-
                 in_pos = 0
 
-        # 2. Check entries for next bar if flat
-        if in_pos == 0 and long_signals[i - 1]:
-            # Fill long at bar i open
+        # 2) entries: only if flat when the signal bar closed
+        if in_pos == 0 and flat_at_prev_close and long_signals[i - 1]:
             entry_px = open_p[i] + slippage_cost
-            entry_comm = capital * commission_pct
-            capital_after_comm = capital - entry_comm
-            qty = capital_after_comm / entry_px
+            entry_capital = capital
+            qty = capital * (1.0 - commission_pct) / entry_px
+            capital = 0.0
             in_pos = 1
             entry_bar = i
             entry_price = entry_px
-
-            # Compute stop & target price
             atr_val = atr_series[i - 1]
             if stop_atr_mult > 0.0 and not np.isnan(atr_val):
-                stop_price = entry_price - (stop_atr_mult * atr_val)
+                stop_price = entry_price - stop_atr_mult * atr_val
             elif stop_pct > 0.0:
                 stop_price = entry_price * (1.0 - stop_pct / 100.0)
             else:
-                stop_price = 0.0
-
+                stop_price = -1.0
             if target_atr_mult > 0.0 and not np.isnan(atr_val):
-                target_price = entry_price + (target_atr_mult * atr_val)
+                target_price = entry_price + target_atr_mult * atr_val
             elif target_pct > 0.0:
                 target_price = entry_price * (1.0 + target_pct / 100.0)
             else:
-                target_price = 1e12
+                target_price = 1e18
 
-        # Record equity
+        # 3) mark to market
         if in_pos == 1:
             equity_curve[i] = qty * close_p[i]
         else:
             equity_curve[i] = capital
 
-    equity_curve[0] = initial_capital
-
     return (
-        t_entry_bar[:trade_count],
-        t_exit_bar[:trade_count],
-        t_entry_price[:trade_count],
-        t_exit_price[:trade_count],
-        t_direction[:trade_count],
-        t_qty[:trade_count],
-        t_pnl[:trade_count],
-        t_return_pct[:trade_count],
-        t_reason[:trade_count],
-        equity_curve,
+        t_entry_bar[:trade_count], t_exit_bar[:trade_count], t_entry_price[:trade_count],
+        t_exit_price[:trade_count], t_direction[:trade_count], t_qty[:trade_count],
+        t_pnl[:trade_count], t_return_pct[:trade_count], t_reason[:trade_count], equity_curve,
     )
 
 
-REASON_MAP = {
-    1: "STOP",
-    2: "TARGET",
-    3: "TIME",
-    4: "OPPOSITE",
-    5: "END",
-}
+TRADE_COLUMNS = [
+    "trade_num", "direction", "entry_time", "entry_bar", "entry_price", "exit_time",
+    "exit_bar", "exit_price", "qty", "pnl", "return_pct", "reason",
+]
 
 
 def simulate(
@@ -197,88 +171,44 @@ def simulate(
     time_bars: int = 0,
     opposite_exit: bool = False,
     commission_pct: float = 0.001,
-    slippage_ticks: int = 1,
+    slippage_ticks: float = 1,
     tick_size: float = 0.01,
     initial_capital: float = 10000.0,
 ) -> tuple[pd.DataFrame, np.ndarray]:
-    """Execute high-performance backtest simulation returning trades DataFrame and equity series."""
+    """Run the bar loop over `df` (already sliced to the window) and return (trades, equity)."""
     n = len(df)
-    open_p = df["open"].to_numpy(dtype=np.float64)
-    high_p = df["high"].to_numpy(dtype=np.float64)
-    low_p = df["low"].to_numpy(dtype=np.float64)
-    close_p = df["close"].to_numpy(dtype=np.float64)
+    long_signals = np.asarray(long_signals, dtype=np.bool_)
+    short_signals = np.zeros(n, dtype=np.bool_) if short_signals is None else np.asarray(short_signals, dtype=np.bool_)
+    atr_series = np.full(n, np.nan) if atr_series is None else np.asarray(atr_series, dtype=np.float64)
+    if (stop_atr_mult > 0 or target_atr_mult > 0) and np.all(np.isnan(atr_series)):
+        raise ValueError("ATR stop/target requested but no ATR series is available (add an indicator with fn: atr)")
 
-    if short_signals is None:
-        short_signals = np.zeros(n, dtype=bool)
-    if atr_series is None:
-        atr_series = np.full(n, np.nan, dtype=np.float64)
-
-    slippage_cost = slippage_ticks * tick_size
-
-    (
-        entry_bars,
-        exit_bars,
-        entry_prices,
-        exit_prices,
-        directions,
-        qtys,
-        pnls,
-        return_pcts,
-        reasons,
-        equity_curve,
-    ) = run_simulation_numba(
-        open_p,
-        high_p,
-        low_p,
-        close_p,
-        long_signals,
-        short_signals,
-        atr_series,
-        float(stop_atr_mult),
-        float(target_atr_mult),
-        float(stop_pct),
-        float(target_pct),
-        int(time_bars),
-        bool(opposite_exit),
-        float(commission_pct),
-        float(slippage_cost),
-        float(initial_capital),
+    out = run_simulation_numba(
+        df["open"].to_numpy(dtype=np.float64), df["high"].to_numpy(dtype=np.float64),
+        df["low"].to_numpy(dtype=np.float64), df["close"].to_numpy(dtype=np.float64),
+        long_signals, short_signals, atr_series,
+        float(stop_atr_mult), float(target_atr_mult), float(stop_pct), float(target_pct),
+        int(time_bars), bool(opposite_exit), float(commission_pct),
+        float(slippage_ticks) * float(tick_size), float(initial_capital),
     )
+    entry_bars, exit_bars, entry_px, exit_px, dirs, qtys, pnls, rets, reasons, equity = out
 
     if len(entry_bars) == 0:
-        trades_df = pd.DataFrame(
-            columns=[
-                "trade_num",
-                "direction",
-                "entry_time",
-                "entry_bar",
-                "entry_price",
-                "exit_time",
-                "exit_bar",
-                "exit_price",
-                "qty",
-                "pnl",
-                "return_pct",
-                "reason",
-            ]
-        )
-    else:
-        timestamps = df["timestamp"].to_numpy()
-        trades_df = pd.DataFrame(
-            {
-                "trade_num": np.arange(1, len(entry_bars) + 1),
-                "direction": ["long" if d == 1 else "short" for d in directions],
-                "entry_time": timestamps[entry_bars],
-                "entry_bar": entry_bars,
-                "entry_price": np.round(entry_prices, 4),
-                "exit_time": timestamps[exit_bars],
-                "exit_bar": exit_bars,
-                "exit_price": np.round(exit_prices, 4),
-                "qty": np.round(qtys, 6),
-                "pnl": np.round(pnls, 2),
-                "return_pct": np.round(return_pcts, 2),
-                "reason": [REASON_MAP.get(r, "OTHER") for r in reasons],
-            }
-        )
+        return pd.DataFrame(columns=TRADE_COLUMNS), equity
 
-    return trades_df, equity_curve
+    ts = df["timestamp"].to_numpy()
+    trades = pd.DataFrame({
+        "trade_num": np.arange(1, len(entry_bars) + 1),
+        "direction": ["long"] * len(entry_bars),
+        "entry_time": ts[entry_bars],
+        "entry_bar": entry_bars,
+        "entry_price": np.round(entry_px, 4),
+        "exit_time": ts[exit_bars],
+        "exit_bar": exit_bars,
+        "exit_price": np.round(exit_px, 4),
+        "qty": np.round(qtys, 8),
+        "pnl": np.round(pnls, 2),
+        "return_pct": np.round(rets, 4),
+        "reason": [REASON_MAP.get(int(r), "OTHER") for r in reasons],
+    })
+    return trades, equity
