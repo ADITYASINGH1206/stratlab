@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/ADITYASINGH1206/stratlab/actions/workflows/ci.yml/badge.svg)](https://github.com/ADITYASINGH1206/stratlab/actions/workflows/ci.yml)
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-StratLab%20Desk-success.svg)](https://adityasingh1206.github.io/stratlab/)
+[![Demo Video](https://img.shields.io/badge/Demo%20Video-YouTube-red.svg)](https://youtu.be/B9JGhf4MqQo)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Flip the Switch, Track 2](https://img.shields.io/badge/Flip%20the%20Switch-Track%202-purple.svg)](https://www.wemakedevs.org/hackathons/switch)
@@ -11,7 +12,8 @@
 
 StratLab turns a Discord channel, or the Mattermost that ships with Switch, into a trading-strategy research desk. Five agents (Strategist, Pine Coder, Backtester, Skeptic and Scribe) share one Switch room with human traders. Every idea goes through the same loop: idea, spec, Pine Script and Python backtest, optimisation, an adversarial review against six promotion gates, and a human verdict.
 
-👉 **[Launch Live Interactive StratLab Desk Demo](https://adityasingh1206.github.io/stratlab/)**
+- 🌐 **Live Interactive Desk UI**: [https://adityasingh1206.github.io/stratlab/](https://adityasingh1206.github.io/stratlab/)
+- 📺 **Demo Video Walkthrough**: [https://youtu.be/B9JGhf4MqQo](https://youtu.be/B9JGhf4MqQo)
 
 ![The StratLab Desk: one strategy's case file with the Skeptic's six gates, equity curve and verdict stamp](docs/desk.png)
 
