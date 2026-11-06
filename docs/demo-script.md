@@ -3,6 +3,7 @@
 **Event**: Flip the Switch Hackathon (WeMakeDevs & DevTools Academy, Nov 2026)  
 **Track**: Track 2 — Best Personal or Creative Workflow ($2,000)  
 **Target Runtime**: 3:00  
+**Demo Video**: [https://youtu.be/B9JGhf4MqQo](https://youtu.be/B9JGhf4MqQo)  
 
 ---
 
