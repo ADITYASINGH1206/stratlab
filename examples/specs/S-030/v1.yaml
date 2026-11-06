@@ -1,0 +1,35 @@
+id: S-030
+version: 1
+name: DCA Dip Buyer on Gold (XAUUSD 1D)
+market:
+  symbol: XAUUSD
+  exchange: oanda
+  tv_symbol: "OANDA:XAUUSD"
+  timeframe: 1d
+period:
+  start: 2020-01-01
+  end: 2025-12-31
+  oos_fraction: 0.3
+direction: long
+params:
+  donchian_len: { default: 20, range: [10, 40, 5] }
+  atr_len: { default: 14, fixed: true }
+  atr_tp: { default: 3.5, range: [2.0, 5.0, 0.5] }
+indicators:
+  upper_band: { fn: highest, src: high, len: $donchian_len }
+  atr: { fn: atr, len: $atr_len }
+entry:
+  long:
+    crosses_below: [close, "upper_band[1]"]
+exit:
+  target: { atr_mult: $atr_tp }
+  time: { bars: 40 }
+risk:
+  sizing: percent_equity
+  value: 100
+  initial_capital: 10000
+  pyramiding: 0
+costs:
+  commission_pct: 0.05
+  slippage_ticks: 1
+  tick_size: 0.01

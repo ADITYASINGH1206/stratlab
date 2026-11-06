@@ -9,7 +9,7 @@ BIN := $(VENV)/bin
 # ~/stratlab-home/bin/stratlab shim that every Switch agent calls by absolute path.
 setup:
 	@if command -v uv >/dev/null 2>&1; then \
-		uv venv $(VENV) && uv pip install --python $(BIN)/python -e ".[dev]"; \
+		uv venv --clear $(VENV) && uv pip install --python $(BIN)/python -e ".[dev]"; \
 	else \
 		$(PYTHON) -m venv $(VENV) && $(BIN)/pip install -q --upgrade pip && $(BIN)/pip install -q -e ".[dev]"; \
 	fi
