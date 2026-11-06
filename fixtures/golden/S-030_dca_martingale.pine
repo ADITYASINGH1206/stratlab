@@ -69,8 +69,7 @@ else
 // === Visual Plots on Chart ===
 plot(strategy.position_size > 0 ? strategy.position_avg_price : na, title="Avg Entry Price", color=color.blue, linewidth=2, style=plot.style_linebr)
 plot(strategy.position_size > 0 ? tpPrice : na, title="Take Profit Target", color=color.green, linewidth=2, style=plot.style_linebr)
-if trendFilterLen > 0
-    plot(emaFilter, title="Trend Filter EMA", color=color.gray, linewidth=1)
+plot(trendFilterLen > 0 ? emaFilter : na, title="Trend Filter EMA", color=color.gray, linewidth=1)
 
 // === Visual Table Dashboard ===
 var table dash = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 30), border_color=color.gray, border_width=1)
