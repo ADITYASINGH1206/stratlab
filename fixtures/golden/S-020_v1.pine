@@ -1,0 +1,83 @@
+//@version=6
+// StratLab Generated Strategy: S-020 v1
+// Name: Donchian Channel Breakout
+// Market: BINANCE:BTCUSDT (4h)
+// Generated automatically by StratLab. Do not hand-edit.
+strategy(
+    title = "S-020 v1: Donchian Channel Breakout",
+    shorttitle = "S-020@v1",
+    overlay = true,
+    initial_capital = 10000.0,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 100.0,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.1,
+    slippage = 1,
+    pyramiding = 0,
+    process_orders_on_close = false
+)
+
+// === Date Range Filter ===
+inDateRange = time >= timestamp("2021-01-01T00:00:00Z") and time <= timestamp("2025-12-31T23:59:59Z")
+
+// === Inputs ===
+
+
+
+donchian_len = input.int(20, title="donchian_len", minval=10, maxval=40, step=5)
+
+
+
+
+
+atr_stop = input.float(2.0, title="atr_stop", minval=1.0, maxval=3.0, step=0.5)
+
+
+
+
+// === Indicators ===
+
+
+
+upper_band = ta.highest(high, donchian_len)
+
+
+
+
+atr = ta.atr(14)
+
+
+
+// === Execution State Variables ===
+var float stopPx = na
+var float tpPx = na
+var int entryBarIndex = na
+
+// === Conditions ===
+
+longSignal = inDateRange and ta.crossover(close, upper_band)
+
+
+// === Orders & Execution ===
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    entryBarIndex := bar_index
+
+    stopPx := close - (atr_stop * atr)
+
+
+    tpPx := na
+
+
+
+if strategy.position_size > 0 and (bar_index - entryBarIndex) >= 40
+    strategy.close("Long", comment="Time Exit")
+
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long", from_entry="Long", stop=stopPx, limit=tpPx)
+
+if strategy.position_size == 0
+    stopPx := na
+    tpPx := na
+    entryBarIndex := na

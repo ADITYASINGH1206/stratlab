@@ -18,6 +18,8 @@ from stratlab.config import get_artifacts_dir, get_specs_dir, init_environment
 from stratlab.data.cache import load_ohlcv
 from stratlab.data.fetch import fetch_and_cache_ohlcv
 from stratlab.engine.backtest import run_backtest
+from stratlab.pine.generate import generate_pine_script
+from stratlab.pine.importer import import_pine_file
 from stratlab.research.gates import evaluate_gates
 from stratlab.research.robust import run_robustness_battery
 from stratlab.research.sweep import run_sweep
@@ -25,6 +27,7 @@ from stratlab.research.walkforward import run_walkforward
 from stratlab.spec.diff import diff_specs, render_diff_text
 from stratlab.spec.models import StrategySpec
 from stratlab.spec.validate import validate_spec_file
+from stratlab.tv.parity import check_trade_parity, render_parity_report
 
 app = typer.Typer(
     name="stratlab",
@@ -513,6 +516,96 @@ def chart_cmd(
         console.print(f"[bold green]Charts Generated[/bold green] in [blue]{target_dir}[/blue]:")
         for k, v in chart_paths.items():
             console.print(f"  - {k}: {v}")
+
+
+@app.command("pine")
+def pine_cmd(
+    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2, or 'import'"),
+    file_path: str | None = typer.Argument(None, help="File path if importing, or output path"),
+    out: str | None = typer.Option(None, "-o", "--out", help="Output .pine file path"),
+    print_code: bool = typer.Option(False, "--print", help="Print Pine code directly to stdout"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Generate Pine Script v6 strategy or import an existing Pine script."""
+    import yaml
+
+    if target == "import":
+        if not file_path:
+            err_console.print("[bold red]Error[/bold red]: Usage: stratlab pine import <file.pine>")
+            raise typer.Exit(code=1)
+        res = import_pine_file(file_path)
+        if as_json:
+            typer.echo(json.dumps(res, indent=2))
+        else:
+            if res["supported"]:
+                console.print(f"[bold green]Import Succeeded[/bold green]: Strategy '{res['spec_dict']['name']}'")
+                console.print(yaml.dump(res["spec_dict"], sort_keys=False))
+            else:
+                err_console.print("[bold yellow]Partial Import with Unsupported Features:[/bold yellow]")
+                for f in res["unsupported_features"]:
+                    err_console.print(f"  - {f}")
+        return
+
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    val = validate_spec_file(spec_path)
+    if not val.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {val.errors}")
+        raise typer.Exit(code=1)
+
+    pine_code = generate_pine_script(val.spec)
+    out_path = Path(out) if out else get_artifacts_dir() / f"{val.spec.id}_v{val.spec.version}.pine"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(pine_code, encoding="utf-8")
+
+    if print_code:
+        typer.echo(pine_code)
+        return
+
+    if as_json:
+        typer.echo(json.dumps({"success": True, "path": str(out_path)}, indent=2))
+    else:
+        console.print(f"[bold green]Generated Pine v6[/bold green] -> [blue]{out_path}[/blue]")
+        console.print(f"  Strategy: {val.spec.name}")
+        console.print(f"  Inputs: {list(val.spec.params.keys())}")
+        console.print(f"  Commission: {val.spec.costs.commission_pct}% | Slippage: {val.spec.costs.slippage_ticks} ticks")
+
+
+@app.command("parity")
+def parity_cmd(
+    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2"),
+    tv_csv: str = typer.Argument(..., help="Path to TradingView 'List of Trades' CSV export"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Compare engine trades against TradingView Strategy Tester CSV export."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    val = validate_spec_file(spec_path)
+    if not val.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {val.errors}")
+        raise typer.Exit(code=1)
+
+    try:
+        rep = check_trade_parity(val.spec, tv_csv)
+    except Exception as e:
+        err_console.print(f"[bold red]Parity Check Failed[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(rep, indent=2))
+    else:
+        console.print(render_parity_report(rep))
+
+    if rep["status"] != "PASS":
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

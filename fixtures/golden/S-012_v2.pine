@@ -1,0 +1,114 @@
+//@version=6
+// StratLab Generated Strategy: S-012 v2
+// Name: RSI reclaim above EMA with ATR target
+// Market: BINANCE:BTCUSDT (4h)
+// Generated automatically by StratLab. Do not hand-edit.
+strategy(
+    title = "S-012 v2: RSI reclaim above EMA with ATR target",
+    shorttitle = "S-012@v2",
+    overlay = true,
+    initial_capital = 10000.0,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 100.0,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.1,
+    slippage = 1,
+    pyramiding = 0,
+    process_orders_on_close = false
+)
+
+// === Date Range Filter ===
+inDateRange = time >= timestamp("2021-01-01T00:00:00Z") and time <= timestamp("2025-12-31T23:59:59Z")
+
+// === Inputs ===
+
+
+
+fast_len = input.int(12, title="fast_len")
+
+
+
+
+
+slow_len = input.int(100, title="slow_len")
+
+
+
+
+
+rsi_len = input.int(14, title="rsi_len")
+
+
+
+
+
+atr_len = input.int(14, title="atr_len")
+
+
+
+
+
+atr_stop = input.float(1.5, title="atr_stop", minval=1.0, maxval=3.0, step=0.5)
+
+
+
+
+
+atr_tp = input.float(3.5, title="atr_tp", minval=2.0, maxval=5.0, step=0.5)
+
+
+
+
+// === Indicators ===
+
+
+
+fast_ema = ta.ema(close, fast_len)
+
+
+
+
+slow_ema = ta.ema(close, slow_len)
+
+
+
+
+rsi = ta.rsi(close, rsi_len)
+
+
+
+
+atr = ta.atr(atr_len)
+
+
+
+// === Execution State Variables ===
+var float stopPx = na
+var float tpPx = na
+var int entryBarIndex = na
+
+// === Conditions ===
+
+longSignal = inDateRange and (ta.crossover(fast_ema, slow_ema) and (rsi > 40))
+
+
+// === Orders & Execution ===
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    entryBarIndex := bar_index
+
+    stopPx := close - (atr_stop * atr)
+
+
+    tpPx := close + (atr_tp * atr)
+
+
+
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long", from_entry="Long", stop=stopPx, limit=tpPx)
+
+if strategy.position_size == 0
+    stopPx := na
+    tpPx := na
+    entryBarIndex := na
