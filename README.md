@@ -50,3 +50,4 @@
 - [ ] **Phase 5: Switch Integration & Room Template** - Switch template YAML (`switch/stratlab.template.yaml`), agent instructions, Lab Charter and Strategy Ledger room documents.
 - [ ] **Phase 6: Hardening, Replay & Edge Cases** - Loop guards, failure recovery, offline replay (`make demo`), clean clone setup.
 - [ ] **Phase 7: Shipping & Demo Video** - Video recording, documentation, blog post, submission.
+

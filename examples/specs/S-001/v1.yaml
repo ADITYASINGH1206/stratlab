@@ -1,0 +1,33 @@
+id: S-001
+version: 1
+name: SMA Golden Cross
+market:
+  symbol: BTCUSDT
+  exchange: binance
+  tv_symbol: "BINANCE:BTCUSDT"
+  timeframe: 4h
+period:
+  start: 2021-01-01
+  end: 2025-12-31
+  oos_fraction: 0.3
+direction: long
+params:
+  fast_len: { default: 20, range: [10, 50, 10] }
+  slow_len: { default: 50, range: [40, 120, 20] }
+indicators:
+  fast_ma: { fn: sma, src: close, len: $fast_len }
+  slow_ma: { fn: sma, src: close, len: $slow_len }
+entry:
+  long:
+    crosses_above: [fast_ma, slow_ma]
+exit:
+  opposite_signal: true
+risk:
+  sizing: percent_equity
+  value: 100
+  initial_capital: 10000
+  pyramiding: 0
+costs:
+  commission_pct: 0.1
+  slippage_ticks: 1
+  tick_size: 0.01
