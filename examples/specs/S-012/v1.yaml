@@ -1,0 +1,41 @@
+id: S-012
+version: 1
+name: RSI reclaim above EMA200 (Baseline)
+market:
+  symbol: BTCUSDT
+  exchange: binance
+  tv_symbol: "BINANCE:BTCUSDT"
+  timeframe: 4h
+period:
+  start: 2021-01-01
+  end: 2025-12-31
+  oos_fraction: 0.3
+direction: long
+params:
+  rsi_len: { default: 9, range: [7, 21, 2] }
+  ema_len: { default: 200, fixed: true }
+  atr_len: { default: 14, fixed: true }
+  atr_stop: { default: 2.0, range: [1.0, 3.0, 0.5] }
+  atr_tp: { default: 3.0, range: [2.0, 5.0, 0.5] }
+indicators:
+  rsi: { fn: rsi, src: close, len: $rsi_len }
+  ema: { fn: ema, src: close, len: $ema_len }
+  atr: { fn: atr, len: $atr_len }
+entry:
+  long:
+    all:
+      - crosses_above: [rsi, 30]
+      - gt: [close, ema]
+exit:
+  stop: { atr_mult: $atr_stop }
+  target: { atr_mult: $atr_tp }
+  time: { bars: 60 }
+risk:
+  sizing: percent_equity
+  value: 100
+  initial_capital: 10000
+  pyramiding: 0
+costs:
+  commission_pct: 0.1
+  slippage_ticks: 1
+  tick_size: 0.01

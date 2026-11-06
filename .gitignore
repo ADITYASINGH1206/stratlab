@@ -38,3 +38,4 @@ data/*.parquet
 !sample_data/*.parquet
 *.sqlite
 .DS_Store
+
