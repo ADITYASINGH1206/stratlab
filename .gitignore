@@ -33,6 +33,7 @@ htmlcov/
 .ruff_cache/
 
 # StratLab local data & run artifacts
+artifacts/
 runs/
 data/*.parquet
 !sample_data/*.parquet

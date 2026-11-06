@@ -37,6 +37,7 @@ def test_pine_generation_all_examples():
         SPEC_DIR / "S-012" / "v1.yaml",
         SPEC_DIR / "S-012" / "v2.yaml",
         SPEC_DIR / "S-020" / "v1.yaml",
+        SPEC_DIR / "S-030" / "v1.yaml",
     ]
     for spec_path in specs:
         val = validate_spec_file(spec_path)

@@ -1,0 +1,95 @@
+//@version=6
+// StratLab S-030 | DCA 8-Level Martingale Dip Accumulator on Gold (XAUUSD 1D)
+// Designed for TradingView Pine Script v6 execution on OANDA:XAUUSD / FOREXCOM:XAUUSD
+// Rules: 
+//   - When market drops by step %, buy Level 1.
+//   - On subsequent drops, doubles position size (Martingale multiplier 2.0x) across up to 8 levels.
+//   - No Stop-Loss (pure spot/unlevered dip accumulation).
+//   - Dynamic Take-Profit calculated from the volume-weighted average position entry price.
+// Research tool, not financial advice.
+
+strategy("StratLab DCA 8-Level Martingale (Gold 1D)", shorttitle="StratLab Gold DCA", overlay=true,
+     initial_capital=10000.0, default_qty_type=strategy.cash, default_qty_value=100.0,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
+     pyramiding=8, process_orders_on_close=true, calc_on_every_tick=false)
+
+// === Date Range Filter ===
+startTs = timestamp("UTC", 2020, 1, 1, 0, 0)
+endTs   = timestamp("UTC", 2025, 12, 31, 23, 59)
+inDateRange = time >= startTs and time <= endTs
+
+// === Strategy Inputs ===
+dropStepPct    = input.float(2.0, title="Drop Step (%) to Add Level", minval=0.5, maxval=10.0, step=0.5, group="DCA Parameters")
+takeProfitPct  = input.float(3.5, title="Take Profit (%) from Avg Price", minval=1.0, maxval=20.0, step=0.5, group="DCA Parameters")
+maxLevels      = input.int(8, title="Max DCA Levels (7-8)", minval=2, maxval=8, group="DCA Parameters")
+multiplier     = input.float(2.0, title="Martingale Size Multiplier", minval=1.0, maxval=3.0, step=0.5, group="DCA Parameters")
+baseOrderCash  = input.float(100.0, title="Base Order USD", minval=10.0, step=10.0, group="DCA Parameters")
+trendFilterLen = input.int(200, title="Regime Filter EMA (0 = disabled)", minval=0, maxval=300, group="Filters")
+
+// === Indicator ===
+emaFilter = trendFilterLen > 0 ? ta.ema(close, trendFilterLen) : 0.0
+trendOk = trendFilterLen == 0 or close > emaFilter
+
+// === State Variables ===
+var float lastEntryPrice = na
+var int currentLevel = 0
+
+// Reset state when flat
+if strategy.position_size == 0
+    currentLevel := 0
+    lastEntryPrice := na
+
+// === Entry Logic (8 DCA Tiers) ===
+// Level 1: Initial Entry when trend is constructive or after a 1D dip
+initialCondition = inDateRange and strategy.position_size == 0 and trendOk
+
+if initialCondition
+    currentLevel := 1
+    lastEntryPrice := close
+    strategy.entry("DCA_L1", strategy.long, qty=baseOrderCash / close, comment="DCA L1 (Base)")
+
+// Subsequent DCA Levels 2 through 8 (Doubling Size)
+if inDateRange and strategy.position_size > 0 and currentLevel < maxLevels
+    dropFromLast = ((lastEntryPrice - close) / lastEntryPrice) * 100.0
+    if dropFromLast >= dropStepPct
+        currentLevel := currentLevel + 1
+        levelQtyCash = baseOrderCash * math.pow(multiplier, currentLevel - 1)
+        lastEntryPrice := close
+        strategy.entry("DCA_L" + str.tostring(currentLevel), strategy.long, qty=levelQtyCash / close, 
+                       comment="DCA L" + str.tostring(currentLevel) + " (" + str.tostring(math.pow(multiplier, currentLevel - 1)) + "x)")
+
+// === Take-Profit Exit (No Stop Loss) ===
+var float tpPrice = na
+if strategy.position_size > 0
+    tpPrice := strategy.position_avg_price * (1.0 + takeProfitPct / 100.0)
+    strategy.exit("TP_Exit", limit=tpPrice, comment="Take Profit +" + str.tostring(takeProfitPct) + "%")
+else
+    tpPrice := na
+
+// === Visual Plots on Chart ===
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na, title="Avg Entry Price", color=color.blue, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? tpPrice : na, title="Take Profit Target", color=color.green, linewidth=2, style=plot.style_linebr)
+if trendFilterLen > 0
+    plot(emaFilter, title="Trend Filter EMA", color=color.gray, linewidth=1)
+
+// === Visual Table Dashboard ===
+var table dash = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 30), border_color=color.gray, border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "StratLab Gold DCA", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "1D Martingale", bgcolor=color.navy, text_color=color.yellow, text_size=size.small)
+    
+    table.cell(dash, 0, 1, "Active Level", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(currentLevel) + " / " + str.tostring(maxLevels), text_color=color.aqua, text_size=size.small)
+    
+    table.cell(dash, 0, 2, "Avg Fill Price", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, strategy.position_size > 0 ? str.tostring(strategy.position_avg_price, "#.##") : "Flat", text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 3, "TP Target", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, strategy.position_size > 0 ? str.tostring(tpPrice, "#.##") : "None", text_color=color.green, text_size=size.small)
+    
+    table.cell(dash, 0, 4, "Total Trades", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 5, "Win Rate", text_color=color.white, text_size=size.small)
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100.0 : 0.0
+    table.cell(dash, 1, 5, str.tostring(winRate, "#.#") + "%", text_color=winRate >= 70 ? color.green : color.orange, text_size=size.small)

@@ -82,3 +82,4 @@
 - TradingView Pine Editor with generated v6 script
 - Interactive StratLab Desk (`docs/stratlab-desk-demo.html` / `artifacts/stratlab-desk.html`)
 - SQLite Strategy Ledger document
+

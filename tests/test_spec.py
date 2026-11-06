@@ -15,13 +15,14 @@ def test_validate_all_example_specs():
         SPEC_DIR / "S-012" / "v1.yaml",
         SPEC_DIR / "S-012" / "v2.yaml",
         SPEC_DIR / "S-020" / "v1.yaml",
+        SPEC_DIR / "S-030" / "v1.yaml",
     ]
     for spec_path in specs:
         assert spec_path.exists(), f"Spec file missing: {spec_path}"
         result = validate_spec_file(spec_path)
         assert result.is_valid, f"Spec {spec_path} failed validation: {result.errors}"
         assert result.spec is not None
-        assert result.spec.id in ("S-001", "S-012", "S-020")
+        assert result.spec.id in ("S-001", "S-012", "S-020", "S-030")
 
 
 def test_schema_generation():
