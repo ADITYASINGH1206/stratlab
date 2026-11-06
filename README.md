@@ -2,7 +2,6 @@
 
 > Describe a strategy in plain English in your team chat. A desk of five agents writes it as a spec, codes it in Pine Script, backtests and optimises it, then tries to break it. You and your friends decide whether it lives.
 
-[![CI](https://img.shields.io/badge/CI-passing-2ea44f?style=flat-square&logo=github-actions&logoColor=white)](https://github.com/ADITYASINGH1206/stratlab/actions)
 [![Track 2](https://img.shields.io/badge/Switch%20Hackathon-Track%202-7c3aed?style=flat-square)](https://www.wemakedevs.org/hackathons/switch)
 [![Live Desk](https://img.shields.io/badge/Live%20Desk-Demo-2563eb?style=flat-square)](https://adityasingh1206.github.io/stratlab/)
 [![Walkthrough](https://img.shields.io/badge/Walkthrough-YouTube-dc2626?style=flat-square&logo=youtube&logoColor=white)](https://youtu.be/B9JGhf4MqQo)
