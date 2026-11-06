@@ -8,12 +8,14 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from stratlab.engine.indicators import check_expression
 from stratlab.spec.models import StrategySpec
 
-SUPPORTED_INDICATORS = {
-    "sma", "ema", "wma", "rsi", "atr", "macd", "bb",
-    "donchian", "stoch", "adx", "vwap", "highest", "lowest", "expr"
-}
+# Only what BOTH the Python engine and the Pine generator implement. Anything else is
+# rejected up front with a readable message instead of failing halfway through a run.
+SUPPORTED_INDICATORS = {"sma", "ema", "wma", "rma", "rsi", "atr", "highest", "lowest", "expr"}
+NOT_YET_SUPPORTED = {"macd", "bb", "donchian", "stoch", "adx", "vwap"}
+INT_FIELDS = ("len",)
 
 SUPPORTED_CONDITIONS = {
     "gt", "lt", "gte", "lte", "eq", "neq",
@@ -105,6 +107,11 @@ def _validate_condition_node(
                             )
 
 
+def _is_int_param(p) -> bool:
+    vals = [p.default] + list(p.range or [])
+    return all(float(v).is_integer() for v in vals)
+
+
 def validate_spec_dict(data: dict[str, Any]) -> ValidationResult:
     """Validate a parsed dictionary against StrategySpec and vocabulary constraints."""
     errors: list[str] = []
@@ -125,42 +132,85 @@ def validate_spec_dict(data: dict[str, Any]) -> ValidationResult:
         except ValueError:
             errors.append(f"Invalid date format for period.{field_name}: '{dt_str}'. Expected YYYY-MM-DD")
 
-    # 2. Check parameter references across indicators, entry, exit
     defined_params = set(spec.params.keys())
 
-    # Check indicators
+    # 2. Every $param anywhere in the spec must be declared
+    for ref in sorted(set(_extract_param_references(data))):
+        if ref not in defined_params:
+            errors.append(f"Undefined parameter reference '${ref}'. Declared params: {sorted(defined_params) or 'none'}")
+
+    # 3. Indicators: supported, defined in order, integer lengths, safe expressions
+    known_series = set(BUILTIN_SERIES)
     for ind_name, ind_cfg in spec.indicators.items():
-        if ind_cfg.fn not in SUPPORTED_INDICATORS:
+        fn = ind_cfg.fn.lower()
+        if ind_name in BUILTIN_SERIES:
+            errors.append(f"Indicator name '{ind_name}' shadows a price series; pick another name")
+        if fn in NOT_YET_SUPPORTED:
+            errors.append(
+                f"Indicator '{ind_name}' uses '{fn}', which is not supported yet in both the engine and the "
+                f"Pine generator. Supported: {', '.join(sorted(SUPPORTED_INDICATORS))}. "
+                f"Tip: build it from these, e.g. a Donchian upper band is highest(high, n)."
+            )
+        elif fn not in SUPPORTED_INDICATORS:
             errors.append(
                 f"Unsupported indicator function '{ind_cfg.fn}' in '{ind_name}'. Supported: {', '.join(sorted(SUPPORTED_INDICATORS))}"
             )
-        # Check source
-        if ind_cfg.src and ind_cfg.src not in BUILTIN_SERIES and ind_cfg.src not in spec.indicators:
-            errors.append(
-                f"Indicator '{ind_name}' source '{ind_cfg.src}' is not a valid OHLCV series or defined indicator"
-            )
+        if fn == "expr":
+            if not ind_cfg.expr:
+                errors.append(f"Indicator '{ind_name}' (fn: expr) needs an `expr`")
+            else:
+                errors.extend(f"Indicator '{ind_name}': {m}" for m in check_expression(ind_cfg.expr, known_series))
+        else:
+            if fn != "atr" and ind_cfg.src and ind_cfg.src not in known_series:
+                errors.append(
+                    f"Indicator '{ind_name}' source '{ind_cfg.src}' must be an OHLCV series or an indicator defined above it"
+                )
+            if ind_cfg.len is None:
+                errors.append(f"Indicator '{ind_name}' (fn: {fn}) needs `len`")
+            elif isinstance(ind_cfg.len, str):
+                pname = ind_cfg.len[1:] if ind_cfg.len.startswith("$") else None
+                if pname in spec.params and not _is_int_param(spec.params[pname]):
+                    errors.append(f"Indicator '{ind_name}' length uses ${pname}, which must be an integer param")
+        known_series.add(ind_name)
 
-        # Check param references in fields
-        for field in [ind_cfg.len, ind_cfg.fast, ind_cfg.slow, ind_cfg.signal, ind_cfg.mult]:
-            if isinstance(field, str) and field.startswith("$"):
-                p = field[1:]
-                if p not in defined_params:
-                    errors.append(f"Undefined parameter reference '{field}' in indicator '{ind_name}'")
+    # 4. Exits the engine can simulate
+    has_atr = any(i.fn.lower() == "atr" for i in spec.indicators.values())
+    for label, lvl in (("stop", spec.exit.stop), ("target", spec.exit.target)):
+        if lvl is None:
+            continue
+        if getattr(lvl, "price", None) is not None:
+            errors.append(f"exit.{label}.price is not supported yet; use atr_mult or pct")
+        if lvl.atr_mult is not None and lvl.pct is not None:
+            errors.append(f"exit.{label}: give atr_mult or pct, not both")
+        if lvl.atr_mult is None and lvl.pct is None and getattr(lvl, "price", None) is None:
+            errors.append(f"exit.{label}: give atr_mult or pct")
+        if lvl.atr_mult is not None and not has_atr:
+            errors.append(f"exit.{label}.atr_mult needs an indicator with fn: atr")
+    if spec.exit.time and isinstance(spec.exit.time.bars, str):
+        pname = spec.exit.time.bars.lstrip("$")
+        if pname in spec.params and not _is_int_param(spec.params[pname]):
+            errors.append(f"exit.time.bars uses ${pname}, which must be an integer param")
+    if spec.exit.opposite_signal and not spec.entry.short:
+        errors.append(
+            "exit.opposite_signal needs an entry.short condition: it is the bearish signal that closes the long"
+        )
+    if not (spec.exit.stop or spec.exit.target or spec.exit.time or spec.exit.opposite_signal):
+        errors.append("Define at least one exit: stop, target, time or opposite_signal (otherwise a trade never closes)")
 
-    # 3. Check param references in exit configs
-    if spec.exit.stop and spec.exit.stop.atr_mult:
-        if isinstance(spec.exit.stop.atr_mult, str) and spec.exit.stop.atr_mult.startswith("$"):
-            p = spec.exit.stop.atr_mult[1:]
-            if p not in defined_params:
-                errors.append(f"Undefined parameter reference '{spec.exit.stop.atr_mult}' in exit.stop.atr_mult")
+    # 5. What the v1 engine simulates
+    if spec.direction != "long":
+        errors.append(
+            f"direction '{spec.direction}' is not supported yet: the engine is long-only. Use direction: long; "
+            f"entry.short with exit.opposite_signal closes the long on a bearish signal."
+        )
+    if spec.risk.sizing != "percent_equity" or spec.risk.value != 100:
+        errors.append("risk: only sizing percent_equity with value 100 is supported (matches the Pine strategy() defaults)")
+    if spec.risk.pyramiding != 0:
+        errors.append("risk.pyramiding must be 0 (one position at a time)")
+    if spec.period.oos_fraction < 0.1 or spec.period.oos_fraction > 0.5:
+        errors.append("period.oos_fraction must be between 0.1 and 0.5")
 
-    if spec.exit.target and spec.exit.target.atr_mult:
-        if isinstance(spec.exit.target.atr_mult, str) and spec.exit.target.atr_mult.startswith("$"):
-            p = spec.exit.target.atr_mult[1:]
-            if p not in defined_params:
-                errors.append(f"Undefined parameter reference '{spec.exit.target.atr_mult}' in exit.target.atr_mult")
-
-    # 4. Check entry conditions
+    # 6. Conditions
     defined_indicators = set(spec.indicators.keys())
     if spec.entry.long:
         _validate_condition_node(spec.entry.long, defined_indicators, defined_params, errors)

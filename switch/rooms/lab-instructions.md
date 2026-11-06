@@ -1,21 +1,18 @@
-# StratLab Lab Room Instructions
+# StratLab #lab
 
-This room (`#lab`) is the active collaboration floor where human traders and autonomous AI quant agents interact.
+Post an idea and the desk specs it, codes it, tests it and attacks it. You decide if it lives.
 
-## Operating Protocol
-1. **Starting an Idea**:
-   - Any member can post an idea: `@strategist idea: buy BTC 4h when RSI(14) crosses above 30 while close > EMA(100); stop at 1.5 ATR, target at 3.5 ATR`.
-2. **Autonomous Workflow**:
-   - `@strategist` creates and validates the specification, then tags `@pine-coder` and `@backtester`.
-   - `@pine-coder` outputs the Pine v6 strategy and configuration summary.
-   - `@backtester` runs backtest, sweep, walkforward, and charts, then tags `@skeptic`.
-   - `@skeptic` performs stress tests and audits G1-G6 against the Lab Charter.
-3. **Escalation & Decision**:
-   - If `@skeptic` reports FAIL: `@strategist` proposes a revision (up to 3 revisions max).
-   - If `@skeptic` reports PASS: Desk pauses and asks for a human verdict (`promote`, `kill`, or `park`).
-4. **Execution of Verdict**:
-   - Once a human replies, `@scribe` updates the Strategy Ledger and notifies `#ledger`.
+## How it runs
+1. Start: `@strategist idea: BTCUSDT 4h, long when RSI(14) crosses above 30 and close > EMA(200); stop 2 ATR, target 3 ATR`.
+2. `@strategist` writes the spec and hands off to `@pine-coder` and `@backtester`.
+3. `@backtester` runs the numbers and hands off to `@skeptic`.
+4. `@skeptic` audits gates G1 to G6 from the Lab Charter. On FAIL, `@strategist` revises, up to 3 versions without a human message. On PASS, the desk waits for you.
+5. Reply `promote`, `kill` or `park`. `@scribe` records it and posts a card in #ledger.
 
-## Roles & Mentions
-- Use `@quant-on-call` to ask for fast numerical evaluations, backtest checks, or data inquiries.
-- Never use Switch task operations (`delegate_task`); hand-offs must be conducted via explicit `@mention` tags and file links.
+## Rules for agents
+- One thread per strategy; the spec ID goes in the first line.
+- End each message with exactly one hand-off line, or `Waiting on a human.`
+- Every number cites its run id. Never estimate a metric.
+- Only a human message containing promote, kill or park ends a thread.
+- Use `@quant-on-call` for a quick "can someone run numbers on X".
+- Hand off with @mentions and files. Do not use Switch task operations (`delegate_task` and the like): Switch marks them as not ready for use.

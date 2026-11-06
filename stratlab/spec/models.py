@@ -3,17 +3,23 @@
 from datetime import date
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class MarketConfig(BaseModel):
+class _Strict(BaseModel):
+    """Unknown keys are errors, so a typo like `stopp:` is reported instead of ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MarketConfig(_Strict):
     symbol: str = Field(description="Trading pair symbol, e.g. BTCUSDT")
     exchange: str = Field(default="binance", description="Exchange identifier")
     tv_symbol: str = Field(description="TradingView symbol notation, e.g. BINANCE:BTCUSDT")
     timeframe: str = Field(default="4h", description="Candle timeframe, e.g. 1h, 4h, 1d")
 
 
-class PeriodConfig(BaseModel):
+class PeriodConfig(_Strict):
     start: date | str = Field(description="Backtest start date, YYYY-MM-DD")
     end: date | str = Field(description="Backtest end date, YYYY-MM-DD")
     oos_fraction: float = Field(
@@ -29,7 +35,7 @@ class PeriodConfig(BaseModel):
         return self
 
 
-class ParamConfig(BaseModel):
+class ParamConfig(_Strict):
     default: float | int
     range: list[float | int] | None = Field(
         default=None,
@@ -50,7 +56,7 @@ class ParamConfig(BaseModel):
         return self
 
 
-class IndicatorConfig(BaseModel):
+class IndicatorConfig(_Strict):
     fn: str = Field(
         description="Indicator function: sma, ema, wma, rsi, atr, macd, bb, donchian, stoch, adx, vwap, highest, lowest, expr"
     )
@@ -63,48 +69,48 @@ class IndicatorConfig(BaseModel):
     mult: float | str | None = Field(default=None, description="Multiplier for BB or $param reference")
 
 
-class StopConfig(BaseModel):
+class StopConfig(_Strict):
     atr_mult: float | str | None = None
     pct: float | str | None = None
     price: float | str | None = None
 
 
-class TargetConfig(BaseModel):
+class TargetConfig(_Strict):
     atr_mult: float | str | None = None
     pct: float | str | None = None
     price: float | str | None = None
 
 
-class TimeExitConfig(BaseModel):
+class TimeExitConfig(_Strict):
     bars: int | str = Field(description="Max bars in trade before forced close")
 
 
-class ExitConfig(BaseModel):
+class ExitConfig(_Strict):
     stop: StopConfig | None = None
     target: TargetConfig | None = None
     time: TimeExitConfig | None = None
     opposite_signal: bool = False
 
 
-class EntryConfig(BaseModel):
+class EntryConfig(_Strict):
     long: dict[str, Any] | None = None
     short: dict[str, Any] | None = None
 
 
-class RiskConfig(BaseModel):
+class RiskConfig(_Strict):
     sizing: Literal["percent_equity", "fixed_qty", "fixed_cash"] = "percent_equity"
     value: float = Field(default=100.0, description="100% equity or fixed quantity/cash")
     initial_capital: float = Field(default=10000.0, description="Starting portfolio capital")
     pyramiding: int = Field(default=0, description="Max open positions in same direction (0 = single position)")
 
 
-class CostsConfig(BaseModel):
+class CostsConfig(_Strict):
     commission_pct: float = Field(default=0.1, description="Commission percentage per side, e.g. 0.1 for 0.1%")
     slippage_ticks: int = Field(default=1, description="Slippage in price ticks")
     tick_size: float = Field(default=0.01, description="Minimum price movement increment")
 
 
-class StrategySpec(BaseModel):
+class StrategySpec(_Strict):
     id: str = Field(description="Unique strategy identifier, e.g. S-012")
     version: int = Field(default=1, ge=1, description="Sequential version number")
     name: str = Field(description="Human readable name of the strategy")

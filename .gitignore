@@ -39,3 +39,5 @@ data/*.parquet
 *.sqlite
 .DS_Store
 
+.ci-home/
+.agents/

@@ -3,6 +3,9 @@
 import os
 from pathlib import Path
 
+# Repository root (examples/, sample_data/), wherever the command is run from.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 # Default workspace directory in user home
 DEFAULT_HOME = Path.home() / "stratlab-home"
 
@@ -50,3 +53,10 @@ def init_environment() -> None:
         get_artifacts_dir(),
     ]:
         directory.mkdir(parents=True, exist_ok=True)
+    from stratlab.research.charter import ensure_charter
+
+    ensure_charter()
+
+
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
+              "4h": 14400, "6h": 21600, "12h": 43200, "1d": 86400}

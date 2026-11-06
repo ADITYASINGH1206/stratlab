@@ -19,7 +19,7 @@ indicators:
   atr: { fn: atr, len: 14 }
 entry:
   long:
-    crosses_above: [close, upper_band]
+    crosses_above: [close, "upper_band[1]"]  # yesterday's channel; today's high is always inside today's channel
 exit:
   stop: { atr_mult: $atr_stop }
   time: { bars: 40 }

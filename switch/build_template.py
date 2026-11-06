@@ -22,6 +22,21 @@ def read_text_strip(path: Path) -> LiteralStr:
     return LiteralStr(path.read_text(encoding="utf-8").strip())
 
 
+def gates_table() -> str:
+    """The Charter's gate table, written from the same YAML that `stratlab gates` reads."""
+    c = yaml.safe_load((Path(__file__).resolve().parent.parent / "stratlab" / "research" / "charter_default.yaml").read_text())
+    dd = c["g6_tail_risk"]["max_drawdown_limit_pct"] * c["g6_tail_risk"]["mc_drawdown_multiple"]
+    rows = [
+        ("G1 Sample size", f"At least {c['g1_sample_size']['min_is_trades']} in-sample and {c['g1_sample_size']['min_oos_trades']} out-of-sample trades"),
+        ("G2 Out-of-sample", f"OOS profit factor at least {c['g2_out_of_sample']['min_oos_pf']}, and OOS PF / IS PF at least {c['g2_out_of_sample']['min_oos_is_pf_ratio']}"),
+        ("G3 Walk-forward", f"Walk-forward efficiency at least {c['g3_walk_forward']['min_wfe']} and at least {c['g3_walk_forward']['min_pct_profitable_windows']}% of blind windows profitable ({c['walk_forward']['is_months']}-month fit, {c['walk_forward']['oos_months']}-month test)"),
+        ("G4 Stability", f"Median in-sample PF of the one-step neighbours at least {c['g4_stability']['min_neighbour_pf_ratio']} x the candidate's"),
+        ("G5 Costs", f"Full-period PF at least {c['g5_costs']['min_stressed_pf']} with {c['g5_costs']['cost_multiplier']:g}x commission and slippage"),
+        ("G6 Tail risk", f"Over {c['g6_tail_risk']['mc_runs']} Monte Carlo reshuffles of the trades: 95th percentile drawdown at most {dd:g}% and 5th percentile ending equity above the starting capital"),
+    ]
+    return "| Gate | Passes when |\n| :--- | :--- |\n" + "\n".join(f"| {g} | {t} |" for g, t in rows)
+
+
 def build_template() -> dict:
     switch_dir = Path(__file__).resolve().parent
     agents_dir = switch_dir / "agents"
@@ -33,7 +48,17 @@ def build_template() -> dict:
     skeptic_md = read_text_strip(agents_dir / "skeptic.md")
     scribe_md = read_text_strip(agents_dir / "scribe.md")
 
-    lab_charter_md = read_text_strip(rooms_dir / "lab-charter.md")
+    common_md = (agents_dir / "_common.md").read_text(encoding="utf-8").strip()
+
+    def with_common(text: str) -> LiteralStr:
+        return LiteralStr(f"{text}\n\n{common_md}")
+
+    strategist_md, pine_coder_md, backtester_md, skeptic_md, scribe_md = (
+        with_common(t) for t in (strategist_md, pine_coder_md, backtester_md, skeptic_md, scribe_md)
+    )
+    lab_charter_md = LiteralStr(
+        read_text_strip(rooms_dir / "lab-charter.md").replace("{{GATES_TABLE}}", gates_table())
+    )
     lab_instructions_md = read_text_strip(rooms_dir / "lab-instructions.md")
     ledger_instructions_md = read_text_strip(rooms_dir / "ledger-instructions.md")
 
@@ -47,7 +72,7 @@ def build_template() -> dict:
             },
             "provider": {
                 "type": "provider",
-                "default": ["claude", "codex", "opencode"],
+                "default": ["claude", "antigravity", "codex", "opencode"],
                 "input": "advanced",
             },
             "location": {

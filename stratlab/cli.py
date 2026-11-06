@@ -1,689 +1,592 @@
-"""Command line interface for StratLab."""
+"""Command line interface for StratLab.
 
+Agents run these commands in their shells and paste the output into the room, so every
+command prints short human text, `--json` prints machine-readable JSON, and any failure is
+one line on stderr with a non-zero exit code.
+"""
+
+from __future__ import annotations
+
+import functools
 import json
+import re
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
 from stratlab import __version__
-from stratlab.charts import (
-    plot_equity_and_drawdown,
-    plot_walkforward_windows,
-    render_metrics_card,
+from stratlab.config import (
+    PROJECT_ROOT,
+    get_artifacts_dir,
+    get_runs_dir,
+    get_specs_dir,
+    init_environment,
 )
-from stratlab.config import get_artifacts_dir, get_specs_dir, init_environment
-from stratlab.data.cache import load_ohlcv
-from stratlab.data.fetch import fetch_and_cache_ohlcv
-from stratlab.engine.backtest import run_backtest
-from stratlab.pine.generate import generate_pine_script
-from stratlab.pine.importer import import_pine_file
-from stratlab.research.gates import evaluate_gates
-from stratlab.research.robust import run_robustness_battery
-from stratlab.research.sweep import run_sweep
-from stratlab.research.walkforward import run_walkforward
-from stratlab.spec.diff import diff_specs, render_diff_text
+from stratlab.engine.registry import to_jsonable
 from stratlab.spec.models import StrategySpec
 from stratlab.spec.validate import validate_spec_file
-from stratlab.tv.parity import check_trade_parity, render_parity_report
 
-app = typer.Typer(
-    name="stratlab",
-    help="StratLab: Adversarial Trading Strategy Research Desk CLI",
-    add_completion=False,
-)
-spec_app = typer.Typer(help="Manage and validate StrategySpec files")
-data_app = typer.Typer(help="Fetch and cache historical OHLCV market data")
-
+app = typer.Typer(name="stratlab", help="StratLab: adversarial trading-strategy research desk", add_completion=False)
+spec_app = typer.Typer(help="Create, find, validate and compare StrategySpec files")
+data_app = typer.Typer(help="Fetch and cache OHLCV market data")
+ledger_app = typer.Typer(help="The Strategy Ledger: verdicts and history")
 app.add_typer(spec_app, name="spec")
 app.add_typer(data_app, name="data")
+app.add_typer(ledger_app, name="ledger")
 
-console = Console()
-err_console = Console(stderr=True)
+console = Console(soft_wrap=True)
+err_console = Console(stderr=True, soft_wrap=True)
+EXAMPLES_DIR = PROJECT_ROOT / "examples" / "specs"
+_REF = re.compile(r"^(S-\d+)(?:@v?(\d+))?$")
+
+
+class CommandError(Exception):
+    """A user-facing error: printed as one line, exit code 1."""
+
+
+def handled(fn):
+    """Turn any exception into a one-line error the agents can post in chat."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except typer.Exit:
+            raise
+        except FileNotFoundError as e:
+            err_console.print(f"Error: {e}", markup=False)
+        except (CommandError, ValueError, KeyError) as e:
+            msg = e.args[0] if isinstance(e, KeyError) and e.args else e
+            err_console.print(f"Error: {msg}", markup=False)
+        except Exception as e:  # noqa: BLE001 - last resort, still one line
+            err_console.print(f"Error: {type(e).__name__}: {e}", markup=False)
+        raise typer.Exit(code=1)
+
+    return wrapper
+
+
+def emit_json(obj: Any) -> None:
+    typer.echo(json.dumps(to_jsonable(obj), indent=2, default=str))
 
 
 @app.callback()
 def main_callback():
-    """StratLab CLI initialized."""
+    """Workspace: $STRATLAB_HOME (default ~/stratlab-home)."""
     init_environment()
 
 
 @app.command()
 def version():
-    """Display the current StratLab version."""
+    """Show the StratLab version."""
     typer.echo(f"StratLab v{__version__}")
 
 
-# ==========================================
-# Spec Subcommands
-# ==========================================
+# ---------------------------------------------------------------- spec resolution
+def _versions(folder: Path) -> list[int]:
+    return sorted(int(m.group(1)) for f in folder.glob("v*.yaml") if (m := re.fullmatch(r"v(\d+)\.yaml", f.name)))
 
+
+def resolve_spec_path(target: str) -> Path:
+    """A file path, `S-012@v2`, `S-012@2` or `S-012` (latest version).
+
+    Looks in $STRATLAB_HOME/specs first (shared by every agent), then the repo examples, so it
+    works from any agent's working directory.
+    """
+    p = Path(target).expanduser()
+    if p.suffix in (".yaml", ".yml") or p.exists():
+        if not p.exists():
+            raise CommandError(f"spec file not found: {target}")
+        return p
+    m = _REF.match(target.strip())
+    if not m:
+        raise CommandError(f"'{target}' is not a spec path or reference like S-012@v2")
+    spec_id, ver = m.group(1), m.group(2)
+    roots = [get_specs_dir(), EXAMPLES_DIR]
+    for root in roots:
+        folder = root / spec_id
+        if not folder.exists():
+            continue
+        if ver:
+            f = folder / f"v{int(ver)}.yaml"
+            if f.exists():
+                return f
+        elif _versions(folder):
+            return folder / f"v{_versions(folder)[-1]}.yaml"
+    raise CommandError(f"spec {target} not found in {get_specs_dir()} or {EXAMPLES_DIR}")
+
+
+def load_spec(target: str) -> StrategySpec:
+    path = resolve_spec_path(target)
+    res = validate_spec_file(path)
+    if not res.is_valid:
+        raise CommandError(f"{path.name} is invalid: " + " | ".join(res.errors))
+    return res.spec
+
+
+def parse_params(spec: StrategySpec, params: str | None) -> dict[str, Any] | None:
+    if not params:
+        return None
+    out: dict[str, Any] = {}
+    for item in re.split(r"[,\s]+", params.strip()):
+        if not item:
+            continue
+        if "=" not in item:
+            raise CommandError(f"bad --params item '{item}': use name=value,name=value")
+        k, v = item.split("=", 1)
+        if k not in spec.params:
+            raise CommandError(f"unknown param '{k}'. Params of {spec.id}@v{spec.version}: {', '.join(spec.params)}")
+        try:
+            out[k] = float(v)
+        except ValueError:
+            raise CommandError(f"param {k}: '{v}' is not a number") from None
+    return out
+
+
+def next_spec_id() -> str:
+    ids = [0]
+    for root in (get_specs_dir(), EXAMPLES_DIR):
+        if root.exists():
+            ids += [int(m.group(1)) for d in root.iterdir() if (m := re.fullmatch(r"S-(\d+)", d.name))]
+    return f"S-{max(ids) + 1:03d}"
+
+
+# ---------------------------------------------------------------- spec
 @spec_app.command("validate")
-def spec_validate(
-    spec_path: str = typer.Argument(..., help="Path to the strategy spec YAML file"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Validate a StrategySpec YAML file against schema and vocabulary constraints."""
-    result = validate_spec_file(spec_path)
-    output_data = result.to_dict()
-
+@handled
+def spec_validate(target: str = typer.Argument(..., help="Spec path or reference, e.g. S-012@v1"),
+                  as_json: bool = typer.Option(False, "--json")):
+    """Validate a spec against the schema and the supported vocabulary."""
+    path = resolve_spec_path(target)
+    result = validate_spec_file(path)
     if as_json:
-        typer.echo(json.dumps(output_data, indent=2))
+        emit_json({**result.to_dict(), "path": str(path)})
+    elif result.is_valid:
+        console.print(f"[bold green]PASS[/bold green]: Spec '{result.spec.id}@v{result.spec.version}' ({result.spec.name}) is valid.")
     else:
-        if result.is_valid:
-            console.print(f"[bold green]PASS[/bold green]: Spec '{result.spec.id}@v{result.spec.version}' ({result.spec.name}) is valid.")
-        else:
-            err_console.print(f"[bold red]FAIL[/bold red]: Spec at '{spec_path}' has errors:")
-            for err in result.errors:
-                err_console.print(f"  - [red]{err}[/red]")
-
+        err_console.print(f"FAIL: {path} has errors:", markup=False)
+        for err in result.errors:
+            err_console.print(f"  - {err}", markup=False)
     if not result.is_valid:
         raise typer.Exit(code=1)
 
 
 @spec_app.command("schema")
 def spec_schema():
-    """Output the JSON schema for StrategySpec."""
-    schema = StrategySpec.model_json_schema()
-    typer.echo(json.dumps(schema, indent=2))
+    """Print the StrategySpec JSON schema."""
+    typer.echo(json.dumps(StrategySpec.model_json_schema(), indent=2))
+
+
+@spec_app.command("path")
+@handled
+def spec_path(target: str = typer.Argument(..., help="Reference, e.g. S-012@v2")):
+    """Print the file a reference resolves to (useful before editing it)."""
+    typer.echo(str(resolve_spec_path(target)))
+
+
+@spec_app.command("list")
+@handled
+def spec_list(as_json: bool = typer.Option(False, "--json")):
+    """List every spec version in the shared workspace and the examples."""
+    rows = []
+    for root, origin in ((get_specs_dir(), "workspace"), (EXAMPLES_DIR, "example")):
+        if root.exists():
+            for folder in sorted(root.glob("S-*")):
+                for v in _versions(folder):
+                    rows.append({"ref": f"{folder.name}@v{v}", "origin": origin, "path": str(folder / f"v{v}.yaml")})
+    if as_json:
+        emit_json(rows)
+        return
+    for r in rows:
+        console.print(f"{r['ref']:<12} {r['origin']:<10} {r['path']}", markup=False)
 
 
 @spec_app.command("diff")
-def spec_diff(
-    spec_a: str = typer.Argument(..., help="Path to spec A (or base version)"),
-    spec_b: str = typer.Argument(..., help="Path to spec B (or revised version)"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Compare two StrategySpec files and show parameter, indicator, and rule changes."""
-    try:
-        diff = diff_specs(spec_a, spec_b)
-    except Exception as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def spec_diff(spec_a: str, spec_b: str, as_json: bool = typer.Option(False, "--json")):
+    """Compare two specs (paths or references)."""
+    from stratlab.spec.diff import diff_specs, render_diff_text
 
-    if as_json:
-        typer.echo(json.dumps(diff, indent=2))
-    else:
-        console.print(render_diff_text(diff))
+    diff = diff_specs(resolve_spec_path(spec_a), resolve_spec_path(spec_b))
+    emit_json(diff) if as_json else console.print(render_diff_text(diff), markup=False)
+
+
+SKELETON = {
+    "direction": "long",
+    "market": {"symbol": "BTCUSDT", "exchange": "binance", "tv_symbol": "BINANCE:BTCUSDT", "timeframe": "4h"},
+    "period": {"start": "2021-01-01", "end": "2025-12-31", "oos_fraction": 0.3},
+    "params": {"fast_len": {"default": 20, "range": [10, 50, 10]}, "slow_len": {"default": 100, "range": [60, 200, 20]},
+               "atr_len": {"default": 14, "fixed": True}, "atr_stop": {"default": 2.0, "range": [1.0, 3.0, 0.5]}},
+    "indicators": {"fast_ma": {"fn": "ema", "src": "close", "len": "$fast_len"},
+                   "slow_ma": {"fn": "ema", "src": "close", "len": "$slow_len"},
+                   "atr": {"fn": "atr", "len": "$atr_len"}},
+    "entry": {"long": {"crosses_above": ["fast_ma", "slow_ma"]}, "short": {"crosses_below": ["fast_ma", "slow_ma"]}},
+    "exit": {"stop": {"atr_mult": "$atr_stop"}, "opposite_signal": True},
+    "risk": {"sizing": "percent_equity", "value": 100, "initial_capital": 10000, "pyramiding": 0},
+    "costs": {"commission_pct": 0.1, "slippage_ticks": 1, "tick_size": 0.01},
+}
 
 
 @spec_app.command("new")
+@handled
 def spec_new(
-    spec_id: str = typer.Option(..., "--id", help="Strategy ID, e.g. S-012"),
-    from_spec: str | None = typer.Option(None, "--from", help="Base spec to increment version from"),
-    name: str = typer.Option("New Strategy", "--name", help="Strategy name"),
+    spec_id: str | None = typer.Option(None, "--id", help="Strategy ID; default: next free S-nnn"),
+    from_spec: str | None = typer.Option(None, "--from", help="Copy this spec (e.g. S-012@v1) as the next version"),
+    name: str = typer.Option("New Strategy", "--name"),
+    as_json: bool = typer.Option(False, "--json"),
 ):
-    """Draft a new StrategySpec or bump version from an existing spec."""
-    specs_dir = get_specs_dir() / spec_id
-    specs_dir.mkdir(parents=True, exist_ok=True)
-
+    """Create specs in the SHARED workspace ($STRATLAB_HOME/specs) so every agent can see them."""
     if from_spec:
-        res = validate_spec_file(from_spec)
-        if not res.is_valid:
-            err_console.print(f"[bold red]Error[/bold red]: Base spec '{from_spec}' is invalid: {res.errors}")
-            raise typer.Exit(code=1)
-        base = res.spec
-        new_version = base.version + 1
-        spec_dict = base.model_dump()
-        spec_dict["version"] = new_version
+        src = resolve_spec_path(from_spec)
+        raw = yaml.safe_load(src.read_text())
+        spec_id = raw["id"]
+        folder = get_specs_dir() / spec_id
+        known = _versions(folder) + _versions(EXAMPLES_DIR / spec_id) + [int(raw["version"])]
+        new_version = max(known) + 1
+        text = re.sub(r"(?m)^version:\s*\d+", f"version: {new_version}", src.read_text(), count=1)
     else:
+        spec_id = spec_id or next_spec_id()
+        if not re.fullmatch(r"S-\d+", spec_id):
+            raise CommandError("--id must look like S-030")
+        folder = get_specs_dir() / spec_id
         new_version = 1
-        spec_dict = {
-            "id": spec_id,
-            "version": 1,
-            "name": name,
-            "market": {
-                "symbol": "BTCUSDT",
-                "exchange": "binance",
-                "tv_symbol": "BINANCE:BTCUSDT",
-                "timeframe": "4h",
-            },
-            "period": {
-                "start": "2021-01-01",
-                "end": "2025-12-31",
-                "oos_fraction": 0.3,
-            },
-            "direction": "long",
-            "params": {
-                "fast_len": {"default": 10, "range": [5, 25, 5]},
-                "slow_len": {"default": 30, "range": [20, 60, 10]},
-            },
-            "indicators": {
-                "fast_ma": {"fn": "sma", "src": "close", "len": "$fast_len"},
-                "slow_ma": {"fn": "sma", "src": "close", "len": "$slow_len"},
-            },
-            "entry": {
-                "long": {"crosses_above": ["fast_ma", "slow_ma"]},
-            },
-            "exit": {
-                "opposite_signal": True,
-            },
-            "risk": {
-                "sizing": "percent_equity",
-                "value": 100,
-                "initial_capital": 10000,
-                "pyramiding": 0,
-            },
-            "costs": {
-                "commission_pct": 0.1,
-                "slippage_ticks": 1,
-                "tick_size": 0.01,
-            },
-        }
-
-    out_file = specs_dir / f"v{new_version}.yaml"
-    import yaml
-    with open(out_file, "w", encoding="utf-8") as f:
-        yaml.dump(spec_dict, f, sort_keys=False)
-
-    console.print(f"[bold green]Created[/bold green]: {out_file}")
+        text = yaml.safe_dump({"id": spec_id, "version": 1, "name": name, **SKELETON}, sort_keys=False)
+    out = folder / f"v{new_version}.yaml"
+    if out.exists():
+        raise CommandError(f"{out} already exists")
+    folder.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    ref = f"{spec_id}@v{new_version}"
+    emit_json({"ref": ref, "path": str(out)}) if as_json else console.print(f"Created {ref}: {out}", markup=False)
 
 
-# ==========================================
-# Data Subcommands
-# ==========================================
-
+# ---------------------------------------------------------------- data
 @data_app.command("fetch")
-def data_fetch(
-    symbol: str = typer.Argument(..., help="Symbol, e.g. BTCUSDT"),
-    timeframe: str = typer.Argument("4h", help="Timeframe, e.g. 1h, 4h, 1d"),
-    start_date: str = typer.Option("2021-01-01", "--from", help="Start date YYYY-MM-DD"),
-    end_date: str | None = typer.Option(None, "--to", help="End date YYYY-MM-DD"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Fetch historical OHLCV data from Binance/yfinance and store in Parquet cache."""
-    with console.status(f"[cyan]Fetching {symbol} ({timeframe}) from {start_date}...[/cyan]"):
-        try:
-            cached_path = fetch_and_cache_ohlcv(symbol, timeframe, start_date, end_date)
-        except Exception as e:
-            err_msg = str(e)
-            if as_json:
-                typer.echo(json.dumps({"success": False, "error": err_msg}))
-            else:
-                err_console.print(f"[bold red]Fetch Failed[/bold red]: {err_msg}")
-            raise typer.Exit(code=1)
+@handled
+def data_fetch(symbol: str, timeframe: str = typer.Argument("4h"),
+               start_date: str = typer.Option("2021-01-01", "--from"), end_date: str | None = typer.Option(None, "--to"),
+               as_json: bool = typer.Option(False, "--json")):
+    """Fetch OHLCV from Binance (ccxt, no key) with a yfinance fallback, into the cache."""
+    from stratlab.data.fetch import fetch_and_cache_ohlcv
 
-    if as_json:
-        typer.echo(json.dumps({"success": True, "path": str(cached_path)}))
-    else:
-        console.print(f"[bold green]Success[/bold green]: Cached {symbol} {timeframe} to [blue]{cached_path}[/blue]")
+    path = fetch_and_cache_ohlcv(symbol, timeframe, start_date, end_date)
+    emit_json({"success": True, "path": str(path)}) if as_json else console.print(f"Cached {symbol} {timeframe} -> {path}", markup=False)
 
 
-def _resolve_spec_path(spec_target: str) -> Path:
-    """Resolve spec file from path or <ID>@v<n> notation."""
-    p = Path(spec_target)
-    if p.exists():
-        return p
-
-    # Check for <ID>@v<n>
-    if "@" in spec_target:
-        spec_id, ver = spec_target.split("@", 1)
-        if not ver.startswith("v"):
-            ver = f"v{ver}"
-        filename = f"{ver}.yaml"
-
-        # Check examples
-        ex_path = Path("examples/specs") / spec_id / filename
-        if ex_path.exists():
-            return ex_path
-
-        # Check user specs
-        user_path = get_specs_dir() / spec_id / filename
-        if user_path.exists():
-            return user_path
-
-    raise FileNotFoundError(f"Could not find strategy spec for target '{spec_target}'")
+# ---------------------------------------------------------------- research
+def _metrics_line(label: str, m: dict) -> str:
+    return (f"{label:<4} trades {m['trades']:>3} | net {m['net_profit_pct']:+7.1f}% | PF {m['profit_factor']:5.2f} | "
+            f"win {m['win_rate_pct']:5.1f}% | maxDD {m['max_drawdown_pct']:5.1f}% | Sharpe {m['sharpe_ratio']:5.2f}")
 
 
 @app.command("backtest")
-def backtest_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    params: str | None = typer.Option(None, "--params", help="Comma-separated overrides, e.g. 'rsi_len=14,atr_stop=2.5'"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Run in-sample and out-of-sample backtest for a strategy spec."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def backtest_cmd(target: str, params: str | None = typer.Option(None, "--params", help="e.g. 'rsi_len=14,atr_stop=2.5'"),
+                 as_json: bool = typer.Option(False, "--json")):
+    """In-sample / out-of-sample backtest (spec defaults unless --params)."""
+    from stratlab.engine.backtest import run_backtest
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    param_overrides: dict[str, Any] = {}
-    if params:
-        for item in params.split(","):
-            if "=" in item:
-                k, v = item.split("=", 1)
-                k = k.strip()
-                v = v.strip()
-                # Parse number if possible
-                try:
-                    param_overrides[k] = int(v) if "." not in v else float(v)
-                except ValueError:
-                    param_overrides[k] = v
-
-    try:
-        results = run_backtest(res.spec, param_overrides=param_overrides, save_run=True)
-    except Exception as e:
-        err_console.print(f"[bold red]Backtest Failed[/bold red]: {e}")
-        raise typer.Exit(code=1)
-
+    spec = load_spec(target)
+    res = run_backtest(spec, param_overrides=parse_params(spec, params), params_source="explicit" if params else "defaults")
     if as_json:
-        typer.echo(json.dumps(results, indent=2))
-    else:
-        m_is = results["is"]
-        m_oos = results.get("oos", {})
-        console.print(f"\n[bold cyan]Backtest Results: {results['spec_id']}@v{results['version']}[/bold cyan] [dim](run_id: {results['run_id']})[/dim]")
-        console.print(f"  [bold]Parameters[/bold]: {results['params']}")
-        console.print(
-            f"  [green]In-Sample[/green]:     Trades: [bold]{m_is['trades']}[/bold] | "
-            f"Net: [bold]{m_is['net_profit_pct']:+.1f}%[/bold] | "
-            f"PF: [bold]{m_is['profit_factor']:.2f}[/bold] | "
-            f"Win%: [bold]{m_is['win_rate_pct']:.1f}%[/bold] | "
-            f"MaxDD: [bold]{m_is['max_drawdown_pct']:.1f}%[/bold] | "
-            f"Sharpe: [bold]{m_is['sharpe_ratio']:.2f}[/bold]"
-        )
-        if m_oos:
-            console.print(
-                f"  [yellow]Out-of-Sample[/yellow]: Trades: [bold]{m_oos['trades']}[/bold] | "
-                f"Net: [bold]{m_oos['net_profit_pct']:+.1f}%[/bold] | "
-                f"PF: [bold]{m_oos['profit_factor']:.2f}[/bold] | "
-                f"Win%: [bold]{m_oos['win_rate_pct']:.1f}%[/bold] | "
-                f"MaxDD: [bold]{m_oos['max_drawdown_pct']:.1f}%[/bold] | "
-                f"Sharpe: [bold]{m_oos['sharpe_ratio']:.2f}[/bold]"
-            )
-        console.print(f"  [dim]Artifacts saved to: {results['run_dir']}[/dim]\n")
+        emit_json(res)
+        return
+    typer.echo(f"{spec.id}@v{spec.version} backtest  run_id {res['run_id']}")
+    typer.echo(f"params {res['params']}")
+    typer.echo(_metrics_line("IS", res["is"]))
+    if res["oos"]:
+        typer.echo(_metrics_line("OOS", res["oos"]))
+    typer.echo(f"files {res['run_dir']}")
 
 
 @app.command("sweep")
-def sweep_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    budget: int = typer.Option(200, "--budget", help="Maximum combinations to evaluate"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Run parameter sweep scored on In-Sample data."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def sweep_cmd(target: str, budget: int = typer.Option(200, "--budget"),
+              min_trades: int | None = typer.Option(None, "--min-trades", help="Default: Lab Charter sweep.min_trades"),
+              as_json: bool = typer.Option(False, "--json")):
+    """Parameter sweep scored on in-sample only. The best eligible combo becomes the candidate."""
+    from stratlab.research.sweep import run_sweep
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    with console.status(f"[cyan]Running sweep for {target} (budget {budget})...[/cyan]"):
-        sweep_df = run_sweep(res.spec, budget=budget)
-
+    spec = load_spec(target)
+    df = run_sweep(spec, budget=budget, min_trades=min_trades)
+    s = df.attrs["summary"]
     if as_json:
-        top10 = sweep_df.head(10).to_dict(orient="records")
-        typer.echo(json.dumps({"total_combos": len(sweep_df), "top_10": top10}, indent=2))
-    else:
-        console.print(f"\n[bold green]Sweep Complete[/bold green]: Evaluated [bold]{len(sweep_df)}[/bold] combinations.")
-        console.print("\n[bold]Top 5 Parameter Sets (by Profit Factor):[/bold]")
-        top5 = sweep_df.head(5)
-        for idx, row in top5.iterrows():
-            params_str = ", ".join(f"{k}={row[k]}" for k in res.spec.params.keys() if k in row)
-            console.print(
-                f"  #{idx + 1}: [cyan]{params_str}[/cyan] -> "
-                f"PF: [bold]{row['profit_factor']:.2f}[/bold] | "
-                f"Net: [bold]{row['net_profit_pct']:+.1f}%[/bold] | "
-                f"Trades: [bold]{int(row['trades'])}[/bold] | "
-                f"MaxDD: [bold]{row['max_drawdown_pct']:.1f}%[/bold]"
-            )
-        console.print()
+        emit_json({**s, "run_id": df.attrs.get("run_id"), "top_10": df.head(10).to_dict(orient="records")})
+        return
+    typer.echo(f"{spec.id}@v{spec.version} sweep  run_id {df.attrs.get('run_id')}")
+    typer.echo(f"evaluated {s['evaluated']} of {s['grid_size']} combos on IS; {s['eligible']} with >= {s['min_trades']} trades")
+    for i, row in df.head(5).iterrows():
+        p = ", ".join(f"{k}={row[k]}" for k in s["tunable"]) or "defaults"
+        flag = "" if row["eligible"] else "  (too few trades)"
+        typer.echo(f"#{i + 1} {p} -> PF {row['profit_factor']:.2f} | net {row['net_profit_pct']:+.1f}% | trades {int(row['trades'])}{flag}")
+    if not s["best_is_eligible"]:
+        typer.echo("warning: no combo reached the minimum trade count; the candidate is unreliable")
 
 
 @app.command("walkforward")
-def walkforward_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Run rolling walk-forward analysis re-optimizing parameters per window."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def walkforward_cmd(target: str,
+                    best: bool = typer.Option(True, "--best/--no-best", help="Re-pick the best params in every window (always on)"),
+                    as_json: bool = typer.Option(False, "--json")):
+    """Rolling walk-forward (24-month IS / 6-month OOS by default, from the Lab Charter)."""
+    from stratlab.research.walkforward import run_walkforward
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    with console.status(f"[cyan]Running Walk-Forward Analysis for {target}...[/cyan]"):
-        wf_res = run_walkforward(res.spec)
-
+    spec = load_spec(target)
+    wf = run_walkforward(spec)
     if as_json:
-        typer.echo(json.dumps(wf_res, indent=2))
-    else:
-        console.print(f"\n[bold green]Walk-Forward Analysis: {target}[/bold green]")
-        console.print(
-            f"  Efficiency (WFE): [bold]{wf_res['walk_forward_efficiency']:.2f}[/bold] | "
-            f"Profitable Windows: [bold]{wf_res['pct_profitable_windows']:.1f}%[/bold] "
-            f"({wf_res.get('total_windows', 0)} total windows)"
-        )
-        for w in wf_res.get("windows", []):
-            console.print(
-                f"  Window {w['window']} ({w['oos_start']} to {w['oos_end']}): "
-                f"IS PF: {w['is_pf']:.2f} -> OOS PF: [bold]{w['oos_pf']:.2f}[/bold] | "
-                f"OOS Net: [bold]{w['oos_net_pct']:+.1f}%[/bold] ({w['oos_trades']} trades)"
-            )
-        console.print()
+        emit_json(wf)
+        return
+    typer.echo(f"{spec.id}@v{spec.version} walk-forward  run_id {wf.get('run_id')}")
+    typer.echo(f"WFE {wf['walk_forward_efficiency']:.2f} | profitable windows {wf['pct_profitable_windows']:.0f}% of {wf['total_windows']}")
+    for w in wf["windows"]:
+        typer.echo(f"W{w['window']} {w['oos_start']}..{w['oos_end']}: IS PF {w['is_pf']:.2f} -> OOS PF {w['oos_pf']:.2f}, "
+                   f"OOS net {w['oos_net_pct']:+.1f}% ({w['oos_trades']} trades)")
 
 
 @app.command("robust")
-def robust_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Run Monte Carlo bootstrap, cost stress, and parameter neighborhood tests."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def robust_cmd(target: str, params: str | None = typer.Option(None, "--params"), as_json: bool = typer.Option(False, "--json")):
+    """Monte Carlo, 2x cost stress and parameter neighbourhood on the candidate params."""
+    from stratlab.research.robust import run_robustness_battery
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    with console.status(f"[cyan]Running Robustness Battery for {target}...[/cyan]"):
-        robust_data = run_robustness_battery(res.spec)
-
+    spec = load_spec(target)
+    r = run_robustness_battery(spec, param_overrides=parse_params(spec, params))
     if as_json:
-        typer.echo(json.dumps(robust_data, indent=2))
+        emit_json(r)
+        return
+    mc, cost, nb = r["monte_carlo"], r["cost_stress"], r["neighbourhood"]
+    typer.echo(f"{spec.id}@v{spec.version} robustness  run_id {r.get('run_id')}")
+    typer.echo(f"candidate {r['params']} (from {r['params_source']})")
+    typer.echo(f"Monte Carlo ({mc['n_simulations']} runs, {mc['n_trades']} trades): 95th pct max DD {mc['pct_95th_max_drawdown']:.1f}%, "
+               f"5th pct final equity ${mc['pct_5th_final_equity']:,.0f}")
+    typer.echo(f"{cost['multiplier']:g}x costs: PF IS {cost['in_sample_pf']:.2f} | OOS {cost['out_of_sample_pf']:.2f} | full {cost['full_period_pf']:.2f}")
+    if nb["stability_ratio"] is None:
+        typer.echo("neighbourhood: n/a (no tunable params)")
     else:
-        mc = robust_data["monte_carlo"]
-        cost = robust_data["cost_stress"]
-        neigh = robust_data["neighbourhood"]
-
-        console.print(f"\n[bold green]Robustness Audit: {target}[/bold green] [dim]({robust_data['run_id']})[/dim]")
-        console.print(
-            f"  [bold]Monte Carlo (1,000 runs)[/bold]: 95th pct Max DD: [bold]{mc['pct_95th_max_drawdown']:.1f}%[/bold] | "
-            f"5th pct Equity: [bold]${mc['pct_5th_final_equity']:.2f}[/bold]"
-        )
-        console.print(
-            f"  [bold]Cost Stress (2x fees & slippage)[/bold]: IS PF: [bold]{cost['in_sample_pf']:.2f}[/bold] | "
-            f"OOS PF: [bold]{cost['out_of_sample_pf']:.2f}[/bold]"
-        )
-        console.print(
-            f"  [bold]Neighbourhood Stability[/bold]: Best PF: {neigh['best_pf']:.2f} -> "
-            f"Median Neighbour PF: [bold]{neigh['median_neighbour_pf']:.2f}[/bold] (Stability Ratio: [bold]{neigh['stability_ratio']:.2f}[/bold])\n"
-        )
+        typer.echo(f"neighbourhood: candidate IS PF {nb['best_pf']:.2f}, median of {nb['tested_neighbours']} neighbours "
+                   f"{nb['median_neighbour_pf']:.2f}, ratio {nb['stability_ratio']:.2f}")
 
 
 @app.command("gates")
+@handled
 def gates_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+    target: str,
+    params: str | None = typer.Option(None, "--params", help="Audit these params instead of the latest sweep best"),
+    set_: list[str] = typer.Option([], "--set", help="Charter override, e.g. --set g2_out_of_sample.min_oos_pf=1.3"),
+    strict: bool = typer.Option(False, "--strict", help="Exit 1 when the verdict is FAIL (for CI)"),
+    as_json: bool = typer.Option(False, "--json"),
 ):
-    """Audit strategy against all 6 Lab Charter promotion gates."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+    """Audit the candidate against the six Lab Charter gates."""
+    from stratlab.research.gates import GATE_TITLES, evaluate_gates
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    with console.status(f"[cyan]Evaluating 6 Promotion Gates for {target}...[/cyan]"):
-        audit = evaluate_gates(res.spec)
-
+    spec = load_spec(target)
+    overrides = {}
+    for item in set_:
+        if "=" not in item:
+            raise CommandError(f"bad --set '{item}', use section.key=value")
+        k, v = item.split("=", 1)
+        overrides[k] = v
+    audit = evaluate_gates(spec, param_overrides=parse_params(spec, params), charter_overrides=overrides)
     if as_json:
-        typer.echo(json.dumps(audit, indent=2))
+        emit_json(audit)
     else:
-        v_color = "green" if audit["verdict"] == "PASS" else "red"
-        console.print(f"\n[bold {v_color}]VERDICT: {audit['verdict']}[/bold {v_color}] ({audit['passed_count']} of {audit['total_gates']} gates passed)")
-        for g_name, g_info in audit["gates"].items():
-            status_text = "[bold green]PASS[/bold green]" if g_info["pass"] else "[bold red]FAIL[/bold red]"
-            console.print(f"  {status_text} [bold]{g_name}[/bold]: {g_info['detail']}")
-        console.print()
-
-    if audit["verdict"] != "PASS":
+        typer.echo(f"{spec.id}@v{spec.version} VERDICT: {audit['verdict']} ({audit['passed_count']} of {audit['total_gates']} gates)")
+        typer.echo(f"candidate {audit['params']} (from {audit['params_source']})  gates run {audit.get('gates_run_id')}")
+        for key, g in audit["gates"].items():
+            typer.echo(f"  {'PASS' if g['pass'] else 'FAIL'} {GATE_TITLES[key]}: {g['detail']}")
+    if strict and audit["verdict"] != "PASS":
         raise typer.Exit(code=1)
 
 
 @app.command("chart")
-def chart_cmd(
-    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
-    output_dir: str | None = typer.Option(None, "--out", help="Output directory for PNG charts"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Generate dark-mode charts: equity curve, heatmap, walkforward bars, and metrics card."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def chart_cmd(target: str, output_dir: str | None = typer.Option(None, "--out"), as_json: bool = typer.Option(False, "--json")):
+    """Equity + drawdown, sweep heatmap, walk-forward bars and a metrics card (PNG, dark theme)."""
+    import pandas as pd
 
-    res = validate_spec_file(spec_path)
-    if not res.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
-        raise typer.Exit(code=1)
-
-    target_dir = Path(output_dir) if output_dir else get_artifacts_dir() / f"{res.spec.id}_v{res.spec.version}"
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Backtest & Equity Curve
-    bt = run_backtest(res.spec, save_run=True)
-    df = load_ohlcv(res.spec.market.symbol, res.spec.market.timeframe)
-    run_dir = Path(bt["run_dir"])
-    with open(run_dir / "metrics.json") as f:
-        metrics_json = json.load(f)
-
-    # Load simulated equity from backtest
-    eq_path = plot_equity_and_drawdown(
-        df,
-        np.array([10000.0] * len(df)),  # fallback or baseline
-        target_dir / "equity.png",
-        title=f"{res.spec.id} v{res.spec.version} Equity Curve",
+    from stratlab.charts import (
+        plot_equity_and_drawdown,
+        plot_param_heatmap,
+        plot_walkforward_windows,
+        render_metrics_card,
     )
+    from stratlab.engine.backtest import run_backtest
+    from stratlab.engine.registry import latest_research_run
+    from stratlab.research.robust import candidate_params
+    from stratlab.research.walkforward import run_walkforward
 
-    # 2. Metrics Card
-    card_path = render_metrics_card(
-        res.spec.id,
-        res.spec.version,
-        metrics_json,
-        equity_curve=None,
-        output_path=target_dir / "card.png",
-    )
-
-    # 3. Walkforward Chart
-    wf = run_walkforward(res.spec, sweep_budget=20)
-    wf_path = plot_walkforward_windows(wf, target_dir / "walkforward.png")
-
-    chart_paths = {
-        "equity": str(eq_path),
-        "card": str(card_path),
-        "walkforward": str(wf_path),
-    }
-
-    if as_json:
-        typer.echo(json.dumps({"success": True, "charts": chart_paths}, indent=2))
-    else:
-        console.print(f"[bold green]Charts Generated[/bold green] in [blue]{target_dir}[/blue]:")
-        for k, v in chart_paths.items():
-            console.print(f"  - {k}: {v}")
+    spec = load_spec(target)
+    out = Path(output_dir) if output_dir else get_artifacts_dir() / f"{spec.id}_v{spec.version}"
+    out.mkdir(parents=True, exist_ok=True)
+    params, source = candidate_params(spec)
+    bt = run_backtest(spec, param_overrides=params, params_source=source)
+    eq = pd.read_csv(Path(bt["run_dir"]) / "equity.csv")
+    eq["timestamp"] = pd.to_datetime(eq["timestamp"])
+    charts = {"equity": str(plot_equity_and_drawdown(eq, eq["equity"].to_numpy(), out / "equity.png",
+                                                     title=f"{spec.id} v{spec.version} equity ({source.split(':')[0]} params)"))}
+    metrics = json.loads((Path(bt["run_dir"]) / "metrics.json").read_text())
+    charts["card"] = str(render_metrics_card(spec.id, spec.version, metrics, equity_curve=eq["equity"].to_numpy(),
+                                             output_path=out / "card.png"))
+    sweep = latest_research_run("sweep", spec)
+    if sweep and len(sweep.get("tunable", [])) >= 2:
+        df = pd.read_csv(get_runs_dir() / sweep["run_id"] / "sweep.csv")
+        axes = sorted(sweep["tunable"], key=lambda k: -df[k].nunique())[:2]
+        charts["heatmap"] = str(plot_param_heatmap(df, axes[0], axes[1], "profit_factor", out / "heatmap.png",
+                                                   title=f"{spec.id} v{spec.version} IS profit factor"))
+    wf = latest_research_run("walkforward", spec) or run_walkforward(spec)
+    if wf.get("windows"):
+        charts["walkforward"] = str(plot_walkforward_windows(wf, out / "walkforward.png"))
+    emit_json({"success": True, "charts": charts}) if as_json else [typer.echo(f"{k}: {v}") for k, v in charts.items()]
 
 
+# ---------------------------------------------------------------- Pine / TradingView
 @app.command("pine")
+@handled
 def pine_cmd(
-    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2, or 'import'"),
-    file_path: str | None = typer.Argument(None, help="File path if importing, or output path"),
-    out: str | None = typer.Option(None, "-o", "--out", help="Output .pine file path"),
-    print_code: bool = typer.Option(False, "--print", help="Print Pine code directly to stdout"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+    target: str = typer.Argument(..., help="Spec reference, or 'import'"),
+    file_path: str | None = typer.Argument(None, help="Pine file to import"),
+    out: str | None = typer.Option(None, "-o", "--out"),
+    print_code: bool = typer.Option(False, "--print"),
+    as_json: bool = typer.Option(False, "--json"),
 ):
-    """Generate Pine Script v6 strategy or import an existing Pine script."""
-    import yaml
+    """Generate Pine Script v6 from a spec, or `pine import file.pine` into a spec draft."""
+    from stratlab.pine.generate import generate_pine_script
+    from stratlab.pine.importer import import_pine_file
 
     if target == "import":
         if not file_path:
-            err_console.print("[bold red]Error[/bold red]: Usage: stratlab pine import <file.pine>")
-            raise typer.Exit(code=1)
+            raise CommandError("usage: stratlab pine import <file.pine>")
         res = import_pine_file(file_path)
         if as_json:
-            typer.echo(json.dumps(res, indent=2))
+            emit_json(res)
+        elif res["supported"]:
+            typer.echo(f"Import Succeeded: Strategy '{res['spec_dict']['name']}'")
+            typer.echo(yaml.safe_dump(res["spec_dict"], sort_keys=False))
         else:
-            if res["supported"]:
-                console.print(f"[bold green]Import Succeeded[/bold green]: Strategy '{res['spec_dict']['name']}'")
-                console.print(yaml.dump(res["spec_dict"], sort_keys=False))
-            else:
-                err_console.print("[bold yellow]Partial Import with Unsupported Features:[/bold yellow]")
-                for f in res["unsupported_features"]:
-                    err_console.print(f"  - {f}")
+            typer.echo("Partial import. Unsupported constructs:")
+            for f in res["unsupported_features"]:
+                typer.echo(f"  - {f}")
         return
-
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
-
-    val = validate_spec_file(spec_path)
-    if not val.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {val.errors}")
-        raise typer.Exit(code=1)
-
-    pine_code = generate_pine_script(val.spec)
-    out_path = Path(out) if out else get_artifacts_dir() / f"{val.spec.id}_v{val.spec.version}.pine"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(pine_code, encoding="utf-8")
-
+    spec = load_spec(target)
+    code = generate_pine_script(spec)
+    path = Path(out) if out else get_artifacts_dir() / f"{spec.id}_v{spec.version}.pine"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(code, encoding="utf-8")
     if print_code:
-        typer.echo(pine_code)
-        return
-
-    if as_json:
-        typer.echo(json.dumps({"success": True, "path": str(out_path)}, indent=2))
+        typer.echo(code)
+    elif as_json:
+        emit_json({"success": True, "path": str(path)})
     else:
-        console.print(f"[bold green]Generated Pine v6[/bold green] -> [blue]{out_path}[/blue]")
-        console.print(f"  Strategy: {val.spec.name}")
-        console.print(f"  Inputs: {list(val.spec.params.keys())}")
-        console.print(f"  Commission: {val.spec.costs.commission_pct}% | Slippage: {val.spec.costs.slippage_ticks} ticks")
+        typer.echo(f"Generated Pine v6 -> {path}")
+        typer.echo(f"inputs {', '.join(spec.params)} | commission {spec.costs.commission_pct}% | slippage {spec.costs.slippage_ticks} tick(s)")
 
 
 @app.command("parity")
-def parity_cmd(
-    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2"),
-    tv_csv: str = typer.Argument(..., help="Path to TradingView 'List of Trades' CSV export"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Compare engine trades against TradingView Strategy Tester CSV export."""
-    try:
-        spec_path = _resolve_spec_path(target)
-    except FileNotFoundError as e:
-        err_console.print(f"[bold red]Error[/bold red]: {e}")
-        raise typer.Exit(code=1)
+@handled
+def parity_cmd(target: str, tv_csv: str = typer.Argument(..., help="TradingView List of Trades CSV"),
+               params: str | None = typer.Option(None, "--params", help="Inputs used in TradingView, if not the defaults"),
+               as_json: bool = typer.Option(False, "--json")):
+    """Compare the engine with a TradingView export of the generated Pine."""
+    from stratlab.tv.parity import check_trade_parity, render_parity_report
 
-    val = validate_spec_file(spec_path)
-    if not val.is_valid:
-        err_console.print(f"[bold red]Invalid Spec[/bold red]: {val.errors}")
-        raise typer.Exit(code=1)
-
-    try:
-        rep = check_trade_parity(val.spec, tv_csv)
-    except Exception as e:
-        err_console.print(f"[bold red]Parity Check Failed[/bold red]: {e}")
-        raise typer.Exit(code=1)
-
-    if as_json:
-        typer.echo(json.dumps(rep, indent=2))
-    else:
-        console.print(render_parity_report(rep))
-
-    if rep["status"] != "PASS":
-        raise typer.Exit(code=1)
+    spec = load_spec(target)
+    rep = check_trade_parity(spec, tv_csv, param_overrides=parse_params(spec, params))
+    emit_json(rep) if as_json else typer.echo(render_parity_report(rep))
 
 
-ledger_app = typer.Typer(help="Manage and query the Strategy Ledger in SQLite")
-app.add_typer(ledger_app, name="ledger")
-
-
+# ---------------------------------------------------------------- ledger
 @ledger_app.command("add")
-def ledger_add_cmd(
-    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2"),
-    verdict: str = typer.Option(..., "--verdict", help="Decision: promote, kill, or park"),
-    by: str = typer.Option(..., "--by", help="Person or role making the decision"),
-    note: str = typer.Option("", "--note", help="Decision notes or reasoning"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Add a strategy decision to the SQLite Strategy Ledger."""
+@handled
+def ledger_add_cmd(target: str, verdict: str = typer.Option(..., "--verdict", help="promote, kill or park"),
+                   by: str = typer.Option(..., "--by"), note: str = typer.Option("", "--note"),
+                   as_json: bool = typer.Option(False, "--json")):
+    """Record a human verdict."""
     from stratlab.engine.ledger import add_ledger_entry
 
-    res = add_ledger_entry(target, verdict, by, note)
+    m = _REF.match(target)
+    if not m or not m.group(2):
+        raise CommandError("use a versioned reference, e.g. S-012@v2")
+    res = add_ledger_entry(f"{m.group(1)}@v{int(m.group(2))}", verdict, by, note)
     if as_json:
-        typer.echo(json.dumps(res, indent=2))
-    else:
-        console.print(f"[bold green]Ledger Updated[/bold green]: {res['spec_id']}@v{res['version']} -> [bold]{res['verdict']}[/bold]")
-        console.print(f"  Decided by: {res['decided_by']}")
-        if res.get("note"):
-            console.print(f"  Note: {res['note']}")
-        if res.get("oos_pf"):
-            console.print(f"  OOS PF: {res['oos_pf']:.2f} | Max DD: {res['oos_max_dd']:.1f}%")
+        emit_json(res)
+        return
+    typer.echo(f"Ledger Updated: {res['spec_id']}@v{res['version']} -> {res['verdict']} by {res['decided_by']}")
+    if res.get("oos_pf") is not None:
+        typer.echo(f"OOS PF {res['oos_pf']:.2f} | OOS max DD {res['oos_max_dd']:.1f}% | failed gates: {res['failed_gates']}")
 
 
 @ledger_app.command("render")
 def ledger_render_cmd():
-    """Render Strategy Ledger as GitHub Flavored Markdown for the room document."""
+    """Markdown for the Strategy Ledger room document."""
     from stratlab.engine.ledger import render_ledger_markdown
 
-    md = render_ledger_markdown()
-    typer.echo(md)
+    typer.echo(render_ledger_markdown())
 
 
 @ledger_app.command("query")
-def ledger_query_cmd(
-    spec: str | None = typer.Option(None, "--spec", help="Filter by spec ID, e.g. S-012"),
-    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
-):
-    """Query entries from the Strategy Ledger."""
+@handled
+def ledger_query_cmd(spec: str | None = typer.Option(None, "--spec"), as_json: bool = typer.Option(False, "--json")):
+    """Ledger entries, optionally for one spec ID."""
     from stratlab.engine.ledger import query_ledger
 
     entries = query_ledger(spec)
     if as_json:
-        typer.echo(json.dumps(entries, indent=2))
-    else:
-        if not entries:
-            console.print("[dim]No ledger entries found.[/dim]")
-            return
-        table = Table(title="Strategy Ledger", header_style="bold magenta")
-        table.add_column("ID", style="cyan")
-        table.add_column("Ver", justify="right")
-        table.add_column("Verdict", style="bold")
-        table.add_column("By")
-        table.add_column("OOS PF", justify="right")
-        table.add_column("OOS DD%", justify="right")
-        table.add_column("Failed Gates")
-        table.add_column("Date")
-        for e in entries:
-            v_color = "green" if e["verdict"] == "PROMOTE" else ("red" if e["verdict"] == "KILL" else "yellow")
-            pf_s = f"{e['oos_pf']:.2f}" if e.get("oos_pf") else "—"
-            dd_s = f"{e['oos_max_dd']:.1f}%" if e.get("oos_max_dd") else "—"
-            table.add_row(
-                e["spec_id"],
-                f"v{e['version']}",
-                f"[{v_color}]{e['verdict']}[/{v_color}]",
-                e["decided_by"],
-                pf_s,
-                dd_s,
-                e.get("failed_gates") or "None",
-                e["created_at"][:10],
-            )
-        console.print(table)
+        emit_json(entries)
+        return
+    if not entries:
+        typer.echo("No ledger entries found.")
+        return
+    table = Table(title="Strategy Ledger", header_style="bold magenta")
+    for col in ("ID", "Ver", "Verdict", "By", "OOS PF", "OOS DD%", "Failed Gates", "Date"):
+        table.add_column(col)
+    for e in entries:
+        table.add_row(e["spec_id"], f"v{e['version']}", e["verdict"], e["decided_by"],
+                      f"{e['oos_pf']:.2f}" if e.get("oos_pf") is not None else "-",
+                      f"{e['oos_max_dd']:.1f}" if e.get("oos_max_dd") is not None else "-",
+                      e.get("failed_gates") or "None", e["created_at"][:10])
+    console.print(table)
+
+
+@ledger_app.command("digest")
+@handled
+def ledger_digest_cmd(as_json: bool = typer.Option(False, "--json")):
+    """What was tried, promoted, killed and parked, and the most common failing gate."""
+    from stratlab.engine.ledger import ledger_digest, render_digest
+
+    d = ledger_digest()
+    emit_json(d) if as_json else typer.echo(render_digest(d))
+
+
+# ---------------------------------------------------------------- desk UI and demo
+@app.command("ui")
+@handled
+def ui_cmd(out: str | None = typer.Option(None, "--out", help="Default: $STRATLAB_HOME/artifacts/stratlab-desk.html"),
+           serve: bool = typer.Option(False, "--serve", help="Also serve it on http://127.0.0.1:PORT"),
+           port: int = typer.Option(8765, "--port")):
+    """Build the StratLab Desk: one offline HTML page with every spec, gate audit, chart and verdict."""
+    from stratlab.ui.build import build_desk
+
+    path = build_desk(Path(out) if out else None)
+    typer.echo(f"StratLab Desk -> {path}")
+    if serve:
+        import functools as ft
+        import http.server
+
+        handler = ft.partial(http.server.SimpleHTTPRequestHandler, directory=str(path.parent))
+        typer.echo(f"serving http://127.0.0.1:{port}/{path.name}  (Ctrl+C to stop)")
+        http.server.ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+
+
+@app.command("demo")
+@handled
+def demo_cmd(budget: int = typer.Option(120, "--budget")):
+    """Offline replay of the room: what each agent would post for S-012 v1 and v2. No Switch, no network."""
+    from stratlab.demo import run_demo
+
+    run_demo(budget=budget)
 
 
 if __name__ == "__main__":

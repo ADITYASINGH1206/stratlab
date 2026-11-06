@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from stratlab.config import get_registry_db, get_runs_dir
+from stratlab.engine.registry import latest_by_id
 
 
 def init_ledger_table() -> Path:
@@ -42,6 +43,9 @@ def add_ledger_entry(
     note: str = "",
 ) -> dict[str, Any]:
     """Add a strategy decision entry (promote, kill, park) to the ledger."""
+    verdict = verdict.strip().lower()
+    if verdict not in ("promote", "kill", "park"):
+        raise ValueError(f"verdict must be promote, kill or park, got '{verdict}'")
     db_path = init_ledger_table()
     if "@v" in target:
         spec_id, v_str = target.split("@v", 1)
@@ -88,6 +92,15 @@ def add_ledger_entry(
                         failed_gates = ", ".join(fails)
                 except Exception:
                     pass
+
+        # Prefer the Skeptic's latest gate audit: it holds the candidate's OOS numbers.
+        gates_run = latest_by_id("gates", spec_id, version)
+        if gates_run:
+            oos = gates_run.get("oos") or {}
+            oos_pf = oos.get("profit_factor", oos_pf)
+            oos_max_dd = oos.get("max_drawdown_pct", oos_max_dd)
+            failed_gates = ", ".join(gates_run.get("failed") or []) or "None"
+            run_id = gates_run.get("gates_run_id") or gates_run.get("run_id") or run_id
 
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         cursor.execute(
@@ -173,4 +186,39 @@ def render_ledger_markdown() -> str:
 
     lines.append("")
     lines.append("*Maintained automatically by `@scribe` via StratLab.*")
+    return "\n".join(lines)
+
+
+def ledger_digest() -> dict[str, Any]:
+    """What was tried, promoted, killed and parked, and which gate fails most often."""
+    entries = query_ledger()
+    counts = {"PROMOTE": 0, "KILL": 0, "PARK": 0}
+    gate_fails: dict[str, int] = {}
+    for e in entries:
+        counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+        for g in (e.get("failed_gates") or "").split(","):
+            g = g.strip()
+            if g and g != "None":
+                gate_fails[g] = gate_fails.get(g, 0) + 1
+    common = max(gate_fails, key=gate_fails.get) if gate_fails else None
+    return {
+        "decisions": len(entries),
+        "specs": sorted({f"{e['spec_id']}@v{e['version']}" for e in entries}),
+        "promoted": counts.get("PROMOTE", 0),
+        "killed": counts.get("KILL", 0),
+        "parked": counts.get("PARK", 0),
+        "gate_failures": gate_fails,
+        "most_common_failure": common,
+    }
+
+
+def render_digest(d: dict[str, Any]) -> str:
+    if not d["decisions"]:
+        return "Digest: nothing in the ledger yet."
+    lines = [
+        f"Digest: {d['decisions']} decisions on {len(d['specs'])} spec versions",
+        f"  promoted {d['promoted']} | killed {d['killed']} | parked {d['parked']}",
+    ]
+    if d["most_common_failure"]:
+        lines.append(f"  most common failure: {d['most_common_failure']} ({d['gate_failures'][d['most_common_failure']]}x)")
     return "\n".join(lines)
