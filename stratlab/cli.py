@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from stratlab import __version__
 from stratlab.charts import (
@@ -606,6 +607,83 @@ def parity_cmd(
 
     if rep["status"] != "PASS":
         raise typer.Exit(code=1)
+
+
+ledger_app = typer.Typer(help="Manage and query the Strategy Ledger in SQLite")
+app.add_typer(ledger_app, name="ledger")
+
+
+@ledger_app.command("add")
+def ledger_add_cmd(
+    target: str = typer.Argument(..., help="Spec target, e.g. S-012@v2"),
+    verdict: str = typer.Option(..., "--verdict", help="Decision: promote, kill, or park"),
+    by: str = typer.Option(..., "--by", help="Person or role making the decision"),
+    note: str = typer.Option("", "--note", help="Decision notes or reasoning"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Add a strategy decision to the SQLite Strategy Ledger."""
+    from stratlab.engine.ledger import add_ledger_entry
+
+    res = add_ledger_entry(target, verdict, by, note)
+    if as_json:
+        typer.echo(json.dumps(res, indent=2))
+    else:
+        console.print(f"[bold green]Ledger Updated[/bold green]: {res['spec_id']}@v{res['version']} -> [bold]{res['verdict']}[/bold]")
+        console.print(f"  Decided by: {res['decided_by']}")
+        if res.get("note"):
+            console.print(f"  Note: {res['note']}")
+        if res.get("oos_pf"):
+            console.print(f"  OOS PF: {res['oos_pf']:.2f} | Max DD: {res['oos_max_dd']:.1f}%")
+
+
+@ledger_app.command("render")
+def ledger_render_cmd():
+    """Render Strategy Ledger as GitHub Flavored Markdown for the room document."""
+    from stratlab.engine.ledger import render_ledger_markdown
+
+    md = render_ledger_markdown()
+    typer.echo(md)
+
+
+@ledger_app.command("query")
+def ledger_query_cmd(
+    spec: str | None = typer.Option(None, "--spec", help="Filter by spec ID, e.g. S-012"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Query entries from the Strategy Ledger."""
+    from stratlab.engine.ledger import query_ledger
+
+    entries = query_ledger(spec)
+    if as_json:
+        typer.echo(json.dumps(entries, indent=2))
+    else:
+        if not entries:
+            console.print("[dim]No ledger entries found.[/dim]")
+            return
+        table = Table(title="Strategy Ledger", header_style="bold magenta")
+        table.add_column("ID", style="cyan")
+        table.add_column("Ver", justify="right")
+        table.add_column("Verdict", style="bold")
+        table.add_column("By")
+        table.add_column("OOS PF", justify="right")
+        table.add_column("OOS DD%", justify="right")
+        table.add_column("Failed Gates")
+        table.add_column("Date")
+        for e in entries:
+            v_color = "green" if e["verdict"] == "PROMOTE" else ("red" if e["verdict"] == "KILL" else "yellow")
+            pf_s = f"{e['oos_pf']:.2f}" if e.get("oos_pf") else "—"
+            dd_s = f"{e['oos_max_dd']:.1f}%" if e.get("oos_max_dd") else "—"
+            table.add_row(
+                e["spec_id"],
+                f"v{e['version']}",
+                f"[{v_color}]{e['verdict']}[/{v_color}]",
+                e["decided_by"],
+                pf_s,
+                dd_s,
+                e.get("failed_gates") or "None",
+                e["created_at"][:10],
+            )
+        console.print(table)
 
 
 if __name__ == "__main__":
