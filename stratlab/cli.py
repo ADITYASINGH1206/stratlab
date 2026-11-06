@@ -1,6 +1,8 @@
 """Command line interface for StratLab."""
 
 import json
+from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -8,6 +10,7 @@ from rich.console import Console
 from stratlab import __version__
 from stratlab.config import get_specs_dir, init_environment
 from stratlab.data.fetch import fetch_and_cache_ohlcv
+from stratlab.engine.backtest import run_backtest
 from stratlab.spec.diff import diff_specs, render_diff_text
 from stratlab.spec.models import StrategySpec
 from stratlab.spec.validate import validate_spec_file
@@ -192,6 +195,96 @@ def data_fetch(
         typer.echo(json.dumps({"success": True, "path": str(cached_path)}))
     else:
         console.print(f"[bold green]Success[/bold green]: Cached {symbol} {timeframe} to [blue]{cached_path}[/blue]")
+
+
+def _resolve_spec_path(spec_target: str) -> Path:
+    """Resolve spec file from path or <ID>@v<n> notation."""
+    p = Path(spec_target)
+    if p.exists():
+        return p
+
+    # Check for <ID>@v<n>
+    if "@" in spec_target:
+        spec_id, ver = spec_target.split("@", 1)
+        if not ver.startswith("v"):
+            ver = f"v{ver}"
+        filename = f"{ver}.yaml"
+
+        # Check examples
+        ex_path = Path("examples/specs") / spec_id / filename
+        if ex_path.exists():
+            return ex_path
+
+        # Check user specs
+        user_path = get_specs_dir() / spec_id / filename
+        if user_path.exists():
+            return user_path
+
+    raise FileNotFoundError(f"Could not find strategy spec for target '{spec_target}'")
+
+
+@app.command("backtest")
+def backtest_cmd(
+    target: str = typer.Argument(..., help="Spec path or notation, e.g. S-012@v1"),
+    params: str | None = typer.Option(None, "--params", help="Comma-separated overrides, e.g. 'rsi_len=14,atr_stop=2.5'"),
+    as_json: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
+):
+    """Run in-sample and out-of-sample backtest for a strategy spec."""
+    try:
+        spec_path = _resolve_spec_path(target)
+    except FileNotFoundError as e:
+        err_console.print(f"[bold red]Error[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    res = validate_spec_file(spec_path)
+    if not res.is_valid:
+        err_console.print(f"[bold red]Invalid Spec[/bold red]: {res.errors}")
+        raise typer.Exit(code=1)
+
+    param_overrides: dict[str, Any] = {}
+    if params:
+        for item in params.split(","):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                # Parse number if possible
+                try:
+                    param_overrides[k] = int(v) if "." not in v else float(v)
+                except ValueError:
+                    param_overrides[k] = v
+
+    try:
+        results = run_backtest(res.spec, param_overrides=param_overrides, save_run=True)
+    except Exception as e:
+        err_console.print(f"[bold red]Backtest Failed[/bold red]: {e}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(results, indent=2))
+    else:
+        m_is = results["is"]
+        m_oos = results.get("oos", {})
+        console.print(f"\n[bold cyan]Backtest Results: {results['spec_id']}@v{results['version']}[/bold cyan] [dim](run_id: {results['run_id']})[/dim]")
+        console.print(f"  [bold]Parameters[/bold]: {results['params']}")
+        console.print(
+            f"  [green]In-Sample[/green]:     Trades: [bold]{m_is['trades']}[/bold] | "
+            f"Net: [bold]{m_is['net_profit_pct']:+.1f}%[/bold] | "
+            f"PF: [bold]{m_is['profit_factor']:.2f}[/bold] | "
+            f"Win%: [bold]{m_is['win_rate_pct']:.1f}%[/bold] | "
+            f"MaxDD: [bold]{m_is['max_drawdown_pct']:.1f}%[/bold] | "
+            f"Sharpe: [bold]{m_is['sharpe_ratio']:.2f}[/bold]"
+        )
+        if m_oos:
+            console.print(
+                f"  [yellow]Out-of-Sample[/yellow]: Trades: [bold]{m_oos['trades']}[/bold] | "
+                f"Net: [bold]{m_oos['net_profit_pct']:+.1f}%[/bold] | "
+                f"PF: [bold]{m_oos['profit_factor']:.2f}[/bold] | "
+                f"Win%: [bold]{m_oos['win_rate_pct']:.1f}%[/bold] | "
+                f"MaxDD: [bold]{m_oos['max_drawdown_pct']:.1f}%[/bold] | "
+                f"Sharpe: [bold]{m_oos['sharpe_ratio']:.2f}[/bold]"
+            )
+        console.print(f"  [dim]Artifacts saved to: {results['run_dir']}[/dim]\n")
 
 
 if __name__ == "__main__":

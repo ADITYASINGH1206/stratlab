@@ -25,3 +25,15 @@ This document records architectural decisions made during development when choic
 - **Context**: Zero-API-key requirement for hackathon reproducibility and offline judge runs.
 - **Decision**: Use `ccxt` connected to Binance public market endpoints to fetch OHLCV, with automatic fallback to `yfinance`. Cache fetched data into PyArrow Parquet files in `$STRATLAB_HOME/data/` or bundled `sample_data/`.
 - **Consequences**: `sample_data/BTCUSDT_4h_2021_2025.parquet` is committed to the repository (498 KB), allowing the entire system to run offline with zero network or API credentials.
+
+---
+
+## ADR-004: TradingView Broker Emulator Parity & Simulation Loop (Phase 2)
+- **Date**: 2026-11-06
+- **Context**: Discrepancies between backtest engines and TradingView's Strategy Tester lead to invalid research results and parity failures.
+- **Decision**: Implemented Numba `@njit` simulation loop matching TradingView's exact broker emulator:
+  1. Orders generated on bar close fill at the *next bar's open*.
+  2. Intrabar price path follows `Open -> High -> Low -> Close` when open is nearer high, and `Open -> Low -> High -> Close` otherwise.
+  3. Stops and targets trigger along this path; price gaps fill at the bar open.
+  4. Indicators match Pine Script formulas: RSI/ATR use Wilder's RMA (alpha = 1/len, seeded with SMA); EMA uses alpha = 2/(len+1) seeded with SMA.
+- **Consequences**: Deterministic execution matching Pine Script v6 defaults, running >10,000 bars in under 1 second.
